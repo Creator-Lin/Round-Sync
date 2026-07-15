@@ -43,6 +43,7 @@ import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import ca.pkay.rcloneexplorer.Database.json.Exporter;
@@ -1010,7 +1011,18 @@ public class Rclone {
     }
 
     public InputStream downloadToPipe(String rclonePath) throws IOException {
-        return startCatProcess(createCommandWithOptions("cat", rclonePath));
+        return downloadToPipe(rclonePath, 0L);
+    }
+
+    /**
+     * Streams a complete remote file and optionally aborts when rclone produces no bytes for the
+     * configured idle interval. Every successful read resets the idle deadline.
+     */
+    public InputStream downloadToPipe(String rclonePath, long idleTimeoutMs) throws IOException {
+        if (idleTimeoutMs < 0) {
+            throw new IllegalArgumentException("idleTimeoutMs must be >= 0");
+        }
+        return startCatProcess(createCommandWithOptions("cat", rclonePath), idleTimeoutMs);
     }
 
     /**
@@ -1025,20 +1037,20 @@ public class Rclone {
     }
 
     /**
-     * Streams a byte range and optionally owns the rclone process with a watchdog timeout.
+     * Streams a byte range and optionally owns the rclone process with an idle watchdog.
      * Closing the returned stream also terminates a still-running process, which prevents a
-     * cancelled or timed-out media probe from leaving an orphaned {@code rclone cat} behind.
+     * cancelled or stalled media probe from leaving an orphaned {@code rclone cat} behind.
      */
     public InputStream downloadRangeToPipe(String rclonePath, long offset, long count,
-            long timeoutMs) throws IOException {
+            long idleTimeoutMs) throws IOException {
         if (offset < 0) {
             throw new IllegalArgumentException("offset must be >= 0");
         }
         if (count < 0) {
             throw new IllegalArgumentException("count must be >= 0");
         }
-        if (timeoutMs < 0) {
-            throw new IllegalArgumentException("timeoutMs must be >= 0");
+        if (idleTimeoutMs < 0) {
+            throw new IllegalArgumentException("idleTimeoutMs must be >= 0");
         }
         return startCatProcess(createCommandWithOptions(
                 "cat",
@@ -1046,14 +1058,14 @@ public class Rclone {
                 "--offset",
                 String.valueOf(offset),
                 "--count",
-                String.valueOf(count)), timeoutMs);
+                String.valueOf(count)), idleTimeoutMs);
     }
 
     private InputStream startCatProcess(String[] command) throws IOException {
         return startCatProcess(command, 0L);
     }
 
-    private InputStream startCatProcess(String[] command, long timeoutMs) throws IOException {
+    private InputStream startCatProcess(String[] command, long idleTimeoutMs) throws IOException {
         String[] env = getRcloneEnv();
         final Process process = getRuntimeProcess(command, env);
         Thread waiter = new Thread(() -> {
@@ -1069,59 +1081,64 @@ public class Rclone {
         waiter.start();
 
         InputStream input = process.getInputStream();
-        return timeoutMs > 0L
-                ? new ManagedProcessInputStream(input, process, timeoutMs)
+        return idleTimeoutMs > 0L
+                ? new ManagedProcessInputStream(input, process, idleTimeoutMs)
                 : input;
     }
 
     private static final class ManagedProcessInputStream extends FilterInputStream {
         private final Process process;
+        private final long idleTimeoutNanos;
+        private final Object watchdogLock = new Object();
         private final AtomicBoolean closed = new AtomicBoolean();
         private final AtomicBoolean timedOut = new AtomicBoolean();
         private final Thread watchdog;
+        private long lastActivityNanos;
 
-        private ManagedProcessInputStream(InputStream input, Process process, long timeoutMs) {
+        private ManagedProcessInputStream(InputStream input, Process process, long idleTimeoutMs) {
             super(input);
             this.process = process;
-            this.watchdog = new Thread(() -> {
-                try {
-                    Thread.sleep(timeoutMs);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-                closeInternal(true);
-            }, "rclone-range-watchdog");
+            this.idleTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(idleTimeoutMs);
+            this.lastActivityNanos = System.nanoTime();
+            this.watchdog = new Thread(this::watchForIdleTimeout, "rclone-cat-idle-watchdog");
             watchdog.setDaemon(true);
             watchdog.start();
         }
 
         @Override
         public int read() throws IOException {
+            int value;
             try {
-                int value = super.read();
-                throwIfTimedOut(value < 0);
-                return value;
-            } catch (IOException e) {
+                value = super.read();
+            } catch (IOException failure) {
                 if (timedOut.get()) {
-                    throw timeoutException(e);
+                    throw timeoutException(failure);
                 }
-                throw e;
+                throw failure;
             }
+            throwIfTimedOut();
+            if (value >= 0) {
+                recordActivity();
+            }
+            return value;
         }
 
         @Override
         public int read(byte[] buffer, int offset, int length) throws IOException {
+            int read;
             try {
-                int read = super.read(buffer, offset, length);
-                throwIfTimedOut(read < 0);
-                return read;
-            } catch (IOException e) {
+                read = super.read(buffer, offset, length);
+            } catch (IOException failure) {
                 if (timedOut.get()) {
-                    throw timeoutException(e);
+                    throw timeoutException(failure);
                 }
-                throw e;
+                throw failure;
             }
+            throwIfTimedOut();
+            if (read > 0) {
+                recordActivity();
+            }
+            return read;
         }
 
         @Override
@@ -1129,15 +1146,54 @@ public class Rclone {
             closeInternal(false);
         }
 
-        private void throwIfTimedOut(boolean endOfStream) throws IOException {
-            if (endOfStream && timedOut.get()) {
+        private void watchForIdleTimeout() {
+            while (!closed.get()) {
+                long remainingNanos;
+                synchronized (watchdogLock) {
+                    if (closed.get()) {
+                        return;
+                    }
+                    long idleNanos = System.nanoTime() - lastActivityNanos;
+                    remainingNanos = idleTimeoutNanos - idleNanos;
+                    if (remainingNanos > 0L) {
+                        long waitMillis = TimeUnit.NANOSECONDS.toMillis(remainingNanos);
+                        int waitNanos = (int) (remainingNanos
+                                - TimeUnit.MILLISECONDS.toNanos(waitMillis));
+                        try {
+                            watchdogLock.wait(waitMillis, waitNanos);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                closeInternal(true);
+                return;
+            }
+        }
+
+        private void recordActivity() {
+            synchronized (watchdogLock) {
+                if (closed.get() || timedOut.get()) {
+                    return;
+                }
+                lastActivityNanos = System.nanoTime();
+                watchdogLock.notifyAll();
+            }
+        }
+
+        private void throwIfTimedOut() throws IOException {
+            if (timedOut.get()) {
                 throw timeoutException(null);
             }
         }
 
         private InterruptedIOException timeoutException(@Nullable IOException cause) {
             InterruptedIOException timeout = new InterruptedIOException(
-                    "Timed out while reading an rclone byte range");
+                    "Timed out after "
+                            + TimeUnit.NANOSECONDS.toMillis(idleTimeoutNanos)
+                            + " ms without data from rclone");
             if (cause != null) {
                 timeout.initCause(cause);
             }
@@ -1145,21 +1201,23 @@ public class Rclone {
         }
 
         private void closeInternal(boolean dueToTimeout) {
-            if (dueToTimeout) {
-                timedOut.set(true);
-            }
             if (!closed.compareAndSet(false, true)) {
                 return;
             }
-            if (!dueToTimeout && Thread.currentThread() != watchdog) {
+            if (dueToTimeout) {
+                timedOut.set(true);
+            }
+            synchronized (watchdogLock) {
+                watchdogLock.notifyAll();
+            }
+            if (Thread.currentThread() != watchdog) {
                 watchdog.interrupt();
             }
+            process.destroy();
             try {
                 in.close();
             } catch (IOException ignored) {
-                // Readers observe the timeout flag and receive an InterruptedIOException.
-            } finally {
-                process.destroy();
+                // A blocked reader observes the timeout flag and receives InterruptedIOException.
             }
         }
     }

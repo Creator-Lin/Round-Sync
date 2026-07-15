@@ -4,7 +4,6 @@ import android.annotation.SuppressLint;
 import android.app.IntentService;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
@@ -102,16 +101,7 @@ public final class ThumbnailPreGenerationService extends IntentService {
         intent.putExtra(SUBMITTED_AT_ARG, System.currentTimeMillis());
 
         try {
-            ComponentName component = ContextCompat.startForegroundService(appContext, intent);
-            if (component == null) {
-                SyncLog.thumbnailError(appContext, THUMBNAIL_LOG_TITLE,
-                        "RECURSIVE SUBMIT FAILED | media="
-                                + cacheType.name().toLowerCase(Locale.US)
-                                + " | remote=" + sanitizeLogValue(remote.getName())
-                                + " | root=" + sanitizeLogValue(rootPath)
-                                + " | error=startForegroundService returned null");
-                return EnqueueResult.FAILED;
-            }
+            ContextCompat.startForegroundService(appContext, intent);
             // Do not write the process-wide sidebar log here. This method runs on the UI
             // thread, and a contended log file lock could delay onStartCommand() enough to
             // violate the foreground-service promotion deadline. The service records

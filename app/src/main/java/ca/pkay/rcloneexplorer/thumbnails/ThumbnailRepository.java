@@ -266,7 +266,8 @@ public final class ThumbnailRepository {
     private static final int REMOTE_MEDIA_READ_AHEAD_BYTES = 4 * 1024 * 1024;
     private static final int REMOTE_MEDIA_MAX_FETCH_BYTES = 8 * 1024 * 1024;
     private static final int REMOTE_MEDIA_CACHED_RANGE_COUNT = 3;
-    private static final long REMOTE_MEDIA_RANGE_TIMEOUT_MS = 45_000L;
+    private static final long REMOTE_MEDIA_RANGE_IDLE_TIMEOUT_MS = 45_000L;
+    private static final long REMOTE_IMAGE_IDLE_TIMEOUT_MS = 45_000L;
     private static final long FAILURE_CACHE_DURATION_MS = 12L * 60L * 60L * 1000L;
     private static final double VIDEO_FRAME_BASE_FRACTION = 1.0d / 3.0d;
     private static final double VIDEO_FRAME_RANDOM_OFFSET_FRACTION = 0.08d;
@@ -1426,7 +1427,7 @@ public final class ThumbnailRepository {
 
         Rclone rclone = new Rclone(context);
         String remotePath = rclone.getRemoteFilePath(item.getRemote(), item);
-        return rclone.downloadToPipe(remotePath);
+        return rclone.downloadToPipe(remotePath, REMOTE_IMAGE_IDLE_TIMEOUT_MS);
     }
 
     @Nullable
@@ -1456,10 +1457,23 @@ public final class ThumbnailRepository {
         double targetFraction = getRandomVideoFrameFraction();
         logThumbnailEvent(false, "STAGE #" + operationId, item, store,
                 "platform video extractor: opening source");
-        Bitmap frame = extractVideoThumbnailWithPlatform(
+        PlatformVideoExtractionResult platformResult = extractVideoThumbnailWithPlatform(
                 item, targetFraction, operationId, store);
-        if (frame != null) {
-            return frame;
+        if (platformResult.frame != null) {
+            return platformResult.frame;
+        }
+
+        if (platformResult.remoteRandomAccessFailed) {
+            String failure = platformResult.remoteFailureMessage == null
+                    ? "remote random-access read failed"
+                    : platformResult.remoteFailureMessage;
+            FLog.d(TAG,
+                    "Platform video extraction confirmed a remote range failure; "
+                            + "skipping bundled FFmpeg for %s: %s",
+                    item.getPath(), failure);
+            logThumbnailEvent(true, "FFMPEG SKIPPED #" + operationId, item, store,
+                    "platform remote random-access failure: " + failure);
+            return null;
         }
 
         // The fallback is deliberately format-agnostic. WMV is a common trigger, but Android's
@@ -1469,7 +1483,7 @@ public final class ThumbnailRepository {
                 item.getPath());
         logThumbnailEvent(false, "STAGE #" + operationId, item, store,
                 "FFmpeg fallback: opening source");
-        frame = extractVideoThumbnailWithFfmpeg(
+        Bitmap frame = extractVideoThumbnailWithFfmpeg(
                 item, targetFraction, operationId, store);
         if (frame == null) {
             FLog.d(TAG, "Bundled FFmpeg video thumbnail failed for %s", item.getPath());
@@ -1477,11 +1491,12 @@ public final class ThumbnailRepository {
         return frame;
     }
 
-    @Nullable
-    private Bitmap extractVideoThumbnailWithPlatform(
+    private PlatformVideoExtractionResult extractVideoThumbnailWithPlatform(
             FileItem item, double targetFraction, long operationId, CacheStore store) {
         MediaMetadataRetriever retriever = new MediaMetadataRetriever();
         MediaDataSource mediaDataSource = null;
+        RcloneRangeMediaDataSource remoteDataSource = null;
+        Bitmap frame = null;
         try {
             if (item.getRemote().getType() == RemoteItem.SAFW) {
                 Uri contentUri = SafAccessProvider.getDirectServer(context)
@@ -1490,10 +1505,11 @@ public final class ThumbnailRepository {
             } else {
                 Rclone rclone = new Rclone(context);
                 String remotePath = rclone.getRemoteFilePath(item.getRemote(), item);
-                mediaDataSource = new RcloneRangeMediaDataSource(
+                remoteDataSource = new RcloneRangeMediaDataSource(
                         rclone,
                         remotePath,
                         item.getSize());
+                mediaDataSource = remoteDataSource;
                 retriever.setDataSource(mediaDataSource);
             }
             logThumbnailEvent(false, "STAGE #" + operationId, item, store,
@@ -1513,7 +1529,6 @@ public final class ThumbnailRepository {
                             + ", dimensions=" + width + "x" + height
                             + ", targetTimeUs=" + targetTimeUs);
 
-            Bitmap frame;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && width > 0 && height > 0) {
                 int[] targetSize = fitInside(width, height, MAX_THUMBNAIL_DIMENSION);
                 frame = retriever.getScaledFrameAtTime(
@@ -1529,21 +1544,24 @@ public final class ThumbnailRepository {
             if (frame == null) {
                 logThumbnailEvent(false, "STAGE #" + operationId, item, store,
                         "platform video extractor returned no frame");
-                return null;
+            } else {
+                logThumbnailEvent(false, "STAGE #" + operationId, item, store,
+                        "platform video extractor returned frame="
+                                + frame.getWidth() + "x" + frame.getHeight());
+                if (rotation == 90 || rotation == 180 || rotation == 270) {
+                    frame = rotate(frame, rotation);
+                }
+                frame = scaleDown(frame, MAX_THUMBNAIL_DIMENSION);
             }
-            logThumbnailEvent(false, "STAGE #" + operationId, item, store,
-                    "platform video extractor returned frame="
-                            + frame.getWidth() + "x" + frame.getHeight());
-            if (rotation == 90 || rotation == 180 || rotation == 270) {
-                frame = rotate(frame, rotation);
-            }
-            return scaleDown(frame, MAX_THUMBNAIL_DIMENSION);
         } catch (RuntimeException e) {
+            if (frame != null && !frame.isRecycled()) {
+                frame.recycle();
+            }
+            frame = null;
             FLog.d(TAG, "Platform video preview extraction failed for %s: %s",
                     item.getPath(), e.getMessage());
             logThumbnailEvent(true, "PLATFORM ERROR #" + operationId, item, store,
                     e.getClass().getSimpleName() + ": " + safeMessage(e));
-            return null;
         } finally {
             logThumbnailEvent(false, "STAGE #" + operationId, item, store,
                     "platform video extractor: releasing source");
@@ -1562,6 +1580,35 @@ public final class ThumbnailRepository {
             }
             logThumbnailEvent(false, "STAGE #" + operationId, item, store,
                     "platform video extractor: source released");
+        }
+
+        boolean remoteRandomAccessFailed = remoteDataSource != null
+                && remoteDataSource.hasRemoteReadFailure();
+        String remoteFailureMessage = remoteDataSource == null
+                ? null
+                : remoteDataSource.getRemoteReadFailureMessage();
+        if (remoteRandomAccessFailed) {
+            logThumbnailEvent(true, "PLATFORM RANGE ERROR #" + operationId, item, store,
+                    remoteFailureMessage == null
+                            ? "remote random-access read failed"
+                            : remoteFailureMessage);
+        }
+        return new PlatformVideoExtractionResult(
+                frame, remoteRandomAccessFailed, remoteFailureMessage);
+    }
+
+    private static final class PlatformVideoExtractionResult {
+        @Nullable
+        private final Bitmap frame;
+        private final boolean remoteRandomAccessFailed;
+        @Nullable
+        private final String remoteFailureMessage;
+
+        private PlatformVideoExtractionResult(@Nullable Bitmap frame,
+                boolean remoteRandomAccessFailed, @Nullable String remoteFailureMessage) {
+            this.frame = frame;
+            this.remoteRandomAccessFailed = remoteRandomAccessFailed;
+            this.remoteFailureMessage = remoteFailureMessage;
         }
     }
 
@@ -1912,6 +1959,8 @@ public final class ThumbnailRepository {
         private final String remotePath;
         private final long sourceSize;
         private final List<CachedRange> cachedRanges;
+        @Nullable
+        private IOException remoteReadFailure;
         private boolean closed;
 
         private RcloneRangeMediaDataSource(Rclone rclone, String remotePath, long sourceSize) {
@@ -1977,6 +2026,21 @@ public final class ThumbnailRepository {
             cachedRanges.clear();
         }
 
+        private synchronized boolean hasRemoteReadFailure() {
+            return remoteReadFailure != null;
+        }
+
+        @Nullable
+        private synchronized String getRemoteReadFailureMessage() {
+            return remoteReadFailure == null ? null : safeMessage(remoteReadFailure);
+        }
+
+        private synchronized void recordRemoteReadFailure(IOException failure) {
+            if (remoteReadFailure == null) {
+                remoteReadFailure = failure;
+            }
+        }
+
         @Nullable
         private CachedRange findCachedRange(long position) {
             for (int index = 0; index < cachedRanges.size(); index++) {
@@ -2009,7 +2073,7 @@ public final class ThumbnailRepository {
             byte[] data = new byte[fetchBytes];
             int totalRead = 0;
             try (InputStream input = rclone.downloadRangeToPipe(
-                    remotePath, position, fetchBytes, REMOTE_MEDIA_RANGE_TIMEOUT_MS)) {
+                    remotePath, position, fetchBytes, REMOTE_MEDIA_RANGE_IDLE_TIMEOUT_MS)) {
                 while (totalRead < fetchBytes) {
                     int read = input.read(data, totalRead, fetchBytes - totalRead);
                     if (read < 0) {
@@ -2020,6 +2084,19 @@ public final class ThumbnailRepository {
                     }
                     totalRead += read;
                 }
+            } catch (IOException failure) {
+                recordRemoteReadFailure(failure);
+                throw failure;
+            }
+
+            if (sourceSize >= 0 && totalRead < fetchBytes) {
+                IOException failure = new IOException(
+                        "Remote byte range ended early: offset=" + position
+                                + ", expected=" + fetchBytes
+                                + ", received=" + totalRead
+                                + ", sourceSize=" + sourceSize);
+                recordRemoteReadFailure(failure);
+                throw failure;
             }
             if (totalRead <= 0) {
                 return null;
