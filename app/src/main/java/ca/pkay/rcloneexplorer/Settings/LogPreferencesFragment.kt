@@ -8,6 +8,7 @@ import androidx.preference.Preference
 import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.PreferenceManager
 import ca.pkay.rcloneexplorer.R
+import ca.pkay.rcloneexplorer.quarkdav.QuarkDavServiceActions
 import ca.pkay.rcloneexplorer.util.FLog
 import de.felixnuesse.extract.extensions.tag
 import de.felixnuesse.extract.settings.preferences.ButtonPreference
@@ -17,7 +18,8 @@ import java.io.InputStreamReader
 import java.util.regex.Pattern
 
 
-class LogPreferencesFragment : PreferenceFragmentCompat() {
+class LogPreferencesFragment : PreferenceFragmentCompat(),
+    SharedPreferences.OnSharedPreferenceChangeListener {
 
     private lateinit var sharedPreferences: SharedPreferences
 
@@ -32,6 +34,31 @@ class LogPreferencesFragment : PreferenceFragmentCompat() {
             sigquitAll()
         }
 
+    }
+
+    override fun onStart() {
+        super.onStart()
+        sharedPreferences.registerOnSharedPreferenceChangeListener(this)
+        notifyQuarkDavLoggingPreference()
+    }
+
+    override fun onStop() {
+        sharedPreferences.unregisterOnSharedPreferenceChangeListener(this)
+        super.onStop()
+    }
+
+    override fun onSharedPreferenceChanged(preferences: SharedPreferences?, key: String?) {
+        if (key == getString(R.string.pref_key_quarkdav_logs)) {
+            notifyQuarkDavLoggingPreference()
+        }
+    }
+
+    private fun notifyQuarkDavLoggingPreference() {
+        val enabled = sharedPreferences.getBoolean(
+            getString(R.string.pref_key_quarkdav_logs),
+            true,
+        )
+        QuarkDavServiceActions.notifyLoggingPreferenceChanged(requireContext(), enabled)
     }
 
 

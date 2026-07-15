@@ -1626,6 +1626,9 @@ public final class ThumbnailRepository {
 
     private void logThumbnailEvent(boolean error, String event, FileItem item,
                                    CacheStore store, String details) {
+        if (!SyncLog.isThumbnailLoggingEnabled(context)) {
+            return;
+        }
         String mediaType = store == null
                 ? "unknown" : store.type.getArchiveName();
         String remote = item == null || item.getRemote() == null
@@ -1643,9 +1646,9 @@ public final class ThumbnailRepository {
                 + (details == null || details.isEmpty() ? "" : " | " + details);
         diagnosticLogExecutor.execute(() -> {
             if (error) {
-                SyncLog.error(context, THUMBNAIL_LOG_TITLE, message);
+                SyncLog.thumbnailError(context, THUMBNAIL_LOG_TITLE, message);
             } else {
-                SyncLog.info(context, THUMBNAIL_LOG_TITLE, message);
+                SyncLog.thumbnailInfo(context, THUMBNAIL_LOG_TITLE, message);
             }
         });
     }

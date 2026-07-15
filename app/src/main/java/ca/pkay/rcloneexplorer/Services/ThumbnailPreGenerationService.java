@@ -2,14 +2,20 @@ package ca.pkay.rcloneexplorer.Services;
 
 import android.annotation.SuppressLint;
 import android.app.IntentService;
+import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.PowerManager;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
+import androidx.core.app.NotificationManagerCompat;
+import androidx.core.content.ContextCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import java.util.ArrayDeque;
@@ -26,6 +32,7 @@ import ca.pkay.rcloneexplorer.Rclone;
 import ca.pkay.rcloneexplorer.thumbnails.ThumbnailRepository;
 import ca.pkay.rcloneexplorer.util.FLog;
 import ca.pkay.rcloneexplorer.util.NotificationUtils;
+import ca.pkay.rcloneexplorer.util.PermissionManager;
 import ca.pkay.rcloneexplorer.util.SyncLog;
 
 /**
@@ -36,10 +43,12 @@ import ca.pkay.rcloneexplorer.util.SyncLog;
 public final class ThumbnailPreGenerationService extends IntentService {
 
     private static final String TAG = "ThumbnailPreGen";
-    private static final String CHANNEL_ID =
+    public static final String CHANNEL_ID =
             "ca.pkay.rcloneexplorer.thumbnail_pre_generation_channel";
     private static final String CHANNEL_NAME = "Thumbnail generation";
     private static final int NOTIFICATION_ID = 181;
+    private static final int IMAGE_COMPLETION_NOTIFICATION_ID = 182;
+    private static final int VIDEO_COMPLETION_NOTIFICATION_ID = 183;
     private static final long NOTIFICATION_UPDATE_INTERVAL_MS = 750L;
     private static final long SIDEBAR_LOG_UPDATE_INTERVAL_MS = 5_000L;
     private static final String THUMBNAIL_LOG_TITLE = "Thumbnail diagnostics";
@@ -52,6 +61,8 @@ public final class ThumbnailPreGenerationService extends IntentService {
             "ca.pkay.rcloneexplorer.thumbnail_pre_generation.start_at_root";
     public static final String CACHE_TYPE_ARG =
             "ca.pkay.rcloneexplorer.thumbnail_pre_generation.cache_type";
+    private static final String SUBMITTED_AT_ARG =
+            "ca.pkay.rcloneexplorer.thumbnail_pre_generation.submitted_at";
 
     public static final String ACTION_COMPLETED =
             "ca.pkay.rcloneexplorer.thumbnail_pre_generation.completed";
@@ -62,6 +73,12 @@ public final class ThumbnailPreGenerationService extends IntentService {
     public static final String RESULT_CACHE_TYPE =
             "ca.pkay.rcloneexplorer.thumbnail_pre_generation.result.cache_type";
 
+    public enum EnqueueResult {
+        STARTED,
+        STARTED_WITHOUT_VISIBLE_NOTIFICATIONS,
+        FAILED
+    }
+
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
 
@@ -70,15 +87,91 @@ public final class ThumbnailPreGenerationService extends IntentService {
         setIntentRedelivery(true);
     }
 
+    public static EnqueueResult enqueue(Context context, RemoteItem remote, String rootPath,
+                                        boolean startAtRoot,
+                                        ThumbnailRepository.CacheType cacheType) {
+        Context appContext = context.getApplicationContext();
+        ensureNotificationChannel(appContext);
+        boolean notificationsVisible = canDisplayNotifications(appContext);
+
+        Intent intent = new Intent(appContext, ThumbnailPreGenerationService.class);
+        intent.putExtra(REMOTE_ARG, remote);
+        intent.putExtra(DIRECTORY_PATH_ARG, rootPath);
+        intent.putExtra(START_AT_ROOT_ARG, startAtRoot);
+        intent.putExtra(CACHE_TYPE_ARG, cacheType.name());
+        intent.putExtra(SUBMITTED_AT_ARG, System.currentTimeMillis());
+
+        try {
+            ComponentName component = ContextCompat.startForegroundService(appContext, intent);
+            if (component == null) {
+                SyncLog.thumbnailError(appContext, THUMBNAIL_LOG_TITLE,
+                        "RECURSIVE SUBMIT FAILED | media="
+                                + cacheType.name().toLowerCase(Locale.US)
+                                + " | remote=" + sanitizeLogValue(remote.getName())
+                                + " | root=" + sanitizeLogValue(rootPath)
+                                + " | error=startForegroundService returned null");
+                return EnqueueResult.FAILED;
+            }
+            // Do not write the process-wide sidebar log here. This method runs on the UI
+            // thread, and a contended log file lock could delay onStartCommand() enough to
+            // violate the foreground-service promotion deadline. The service records
+            // FOREGROUND READY as soon as promotion succeeds.
+            return notificationsVisible
+                    ? EnqueueResult.STARTED
+                    : EnqueueResult.STARTED_WITHOUT_VISIBLE_NOTIFICATIONS;
+        } catch (RuntimeException error) {
+            FLog.e(TAG, "Unable to start recursive thumbnail foreground service", error);
+            SyncLog.thumbnailError(appContext, THUMBNAIL_LOG_TITLE,
+                    "RECURSIVE SUBMIT FAILED | media="
+                            + cacheType.name().toLowerCase(Locale.US)
+                            + " | remote=" + sanitizeLogValue(remote.getName())
+                            + " | root=" + sanitizeLogValue(rootPath)
+                            + " | error=" + error.getClass().getSimpleName()
+                            + ": " + sanitizeLogValue(error.getMessage()));
+            return EnqueueResult.FAILED;
+        }
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
-        NotificationUtils.createNotificationChannel(
-                this,
-                CHANNEL_ID,
-                CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_LOW,
-                getString(R.string.thumbnail_recursive_notification_channel_description));
+        ensureNotificationChannel(this);
+    }
+
+    @Override
+    public int onStartCommand(@Nullable Intent intent, int flags, int startId) {
+        ThumbnailRepository.CacheType cacheType = intent == null
+                ? null
+                : parseCacheType(intent.getStringExtra(CACHE_TYPE_ARG));
+        if (cacheType == null) {
+            FLog.e(TAG, "Ignoring malformed recursive thumbnail generation request");
+            SyncLog.thumbnailError(this, THUMBNAIL_LOG_TITLE,
+                    "RECURSIVE SERVICE REJECTED | startId=" + startId
+                            + " | error=missing or invalid cache type");
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+
+        // startForegroundService() must be followed by startForeground promptly. Do this on
+        // the main service callback, before IntentService queues the request or any disk log.
+        try {
+            promoteToForeground(cacheType, 0, 0);
+        } catch (RuntimeException error) {
+            FLog.e(TAG, "Unable to promote recursive thumbnail service to foreground", error);
+            SyncLog.thumbnailError(this, THUMBNAIL_LOG_TITLE,
+                    "RECURSIVE FOREGROUND FAILED | startId=" + startId
+                            + " | media=" + cacheType.name().toLowerCase(Locale.US)
+                            + " | error=" + error.getClass().getSimpleName()
+                            + ": " + sanitizeLogValue(error.getMessage()));
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+
+        SyncLog.thumbnailInfo(this, THUMBNAIL_LOG_TITLE,
+                "RECURSIVE FOREGROUND READY | startId=" + startId
+                        + " | media=" + cacheType.name().toLowerCase(Locale.US)
+                        + " | " + notificationStateForLog(this));
+        return super.onStartCommand(intent, flags, startId);
     }
 
     @Override
@@ -90,46 +183,59 @@ public final class ThumbnailPreGenerationService extends IntentService {
         RemoteItem remote = intent.getParcelableExtra(REMOTE_ARG);
         String rootPath = intent.getStringExtra(DIRECTORY_PATH_ARG);
         boolean startAtRoot = intent.getBooleanExtra(START_AT_ROOT_ARG, false);
+        long submittedAt = intent.getLongExtra(SUBMITTED_AT_ARG, 0L);
+        long queueWaitMs = submittedAt <= 0L
+                ? -1L
+                : Math.max(0L, System.currentTimeMillis() - submittedAt);
         ThumbnailRepository.CacheType cacheType = parseCacheType(
                 intent.getStringExtra(CACHE_TYPE_ARG));
         if (remote == null || rootPath == null || cacheType == null) {
             FLog.e(TAG, "Ignoring malformed recursive thumbnail generation request");
+            SyncLog.thumbnailError(this, THUMBNAIL_LOG_TITLE,
+                    "RECURSIVE WORK REJECTED | error=missing remote, root path or cache type");
+            stopForeground(true);
             return;
         }
 
-        SyncLog.info(this, THUMBNAIL_LOG_TITLE,
-                "RECURSIVE START | media=" + cacheType.name().toLowerCase(Locale.US)
-                        + " | remote=" + sanitizeLogValue(remote.getName())
-                        + " | root=" + sanitizeLogValue(rootPath));
-        startForeground(NOTIFICATION_ID, buildActiveNotification(cacheType, 0, 0));
-        acquireResourceLocks();
-        GenerationSummary summary;
+        GenerationSummary summary = new GenerationSummary();
         try {
+            // Re-assert the currently handled media type because another queued start command
+            // may have refreshed the shared foreground notification in the meantime.
+            promoteToForeground(cacheType, 0, 0);
+            SyncLog.thumbnailInfo(this, THUMBNAIL_LOG_TITLE,
+                    "RECURSIVE START | media=" + cacheType.name().toLowerCase(Locale.US)
+                            + " | remote=" + sanitizeLogValue(remote.getName())
+                            + " | root=" + sanitizeLogValue(rootPath)
+                            + " | queueWaitMs=" + queueWaitMs);
+            acquireResourceLocks();
             summary = generateRecursively(remote, rootPath, startAtRoot, cacheType);
         } catch (RuntimeException error) {
             FLog.e(TAG, "Recursive thumbnail generation failed", error);
-            SyncLog.error(this, THUMBNAIL_LOG_TITLE,
+            SyncLog.thumbnailError(this, THUMBNAIL_LOG_TITLE,
                     "RECURSIVE ERROR | media=" + cacheType.name().toLowerCase(Locale.US)
                             + " | remote=" + sanitizeLogValue(remote.getName())
                             + " | root=" + sanitizeLogValue(rootPath)
                             + " | error=" + error.getClass().getSimpleName()
                             + ": " + sanitizeLogValue(error.getMessage()));
-            summary = new GenerationSummary();
             summary.fatalError = true;
         } finally {
             releaseResourceLocks();
         }
 
-        SyncLog.info(this, THUMBNAIL_LOG_TITLE,
+        SyncLog.thumbnailInfo(this, THUMBNAIL_LOG_TITLE,
                 "RECURSIVE FINISH | media=" + cacheType.name().toLowerCase(Locale.US)
                         + " | remote=" + sanitizeLogValue(remote.getName())
                         + " | root=" + sanitizeLogValue(rootPath)
                         + " | " + summaryForLog(summary));
+
+        // Remove the ongoing foreground entry first, then publish the result under a
+        // different ID. Keeping foreground lifecycle and completion notifications separate
+        // prevents stopForeground() or a newly queued task from erasing the final summary.
+        stopForeground(true);
         NotificationUtils.createNotification(
                 this,
-                NOTIFICATION_ID,
+                getCompletionNotificationId(cacheType),
                 buildCompletedNotification(cacheType, summary));
-        stopForeground(false);
         broadcastCompletion(remote, rootPath, cacheType);
     }
 
@@ -161,7 +267,7 @@ public final class ThumbnailPreGenerationService extends IntentService {
                 continue;
             }
 
-            SyncLog.info(this, THUMBNAIL_LOG_TITLE,
+            SyncLog.thumbnailInfo(this, THUMBNAIL_LOG_TITLE,
                     "RECURSIVE SCAN | media=" + cacheType.name().toLowerCase(Locale.US)
                             + " | remote=" + sanitizeLogValue(remote.getName())
                             + " | folder=" + sanitizeLogValue(folderPath)
@@ -178,6 +284,10 @@ public final class ThumbnailPreGenerationService extends IntentService {
                 continue;
             }
             summary.scannedFolders++;
+            // Publish folder progress before processing the first matching file. If that file
+            // blocks during remote download or decoding, the notification still proves that
+            // directory traversal reached this point.
+            updateActiveNotification(cacheType, summary);
 
             for (FileItem item : content) {
                 if (Thread.currentThread().isInterrupted()) {
@@ -228,7 +338,7 @@ public final class ThumbnailPreGenerationService extends IntentService {
                     lastNotificationUpdate = now;
                 }
                 if (now - lastSidebarLogUpdate >= SIDEBAR_LOG_UPDATE_INTERVAL_MS) {
-                    SyncLog.info(this, THUMBNAIL_LOG_TITLE,
+                    SyncLog.thumbnailInfo(this, THUMBNAIL_LOG_TITLE,
                             "RECURSIVE PROGRESS | media="
                                     + cacheType.name().toLowerCase(Locale.US)
                                     + " | remote=" + sanitizeLogValue(remote.getName())
@@ -245,6 +355,65 @@ public final class ThumbnailPreGenerationService extends IntentService {
             updateActiveNotification(cacheType, summary);
         }
         return summary;
+    }
+
+    private static void ensureNotificationChannel(Context context) {
+        NotificationUtils.createNotificationChannel(
+                context,
+                CHANNEL_ID,
+                CHANNEL_NAME,
+                NotificationManager.IMPORTANCE_LOW,
+                context.getString(R.string.thumbnail_recursive_notification_channel_description));
+    }
+
+    private static boolean canDisplayNotifications(Context context) {
+        if (!new PermissionManager(context).grantedNotifications()
+                || !NotificationManagerCompat.from(context).areNotificationsEnabled()) {
+            return false;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager manager =
+                    (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+            NotificationChannel channel = manager == null
+                    ? null
+                    : manager.getNotificationChannel(CHANNEL_ID);
+            return channel == null || channel.getImportance() != NotificationManager.IMPORTANCE_NONE;
+        }
+        return true;
+    }
+
+    private static String notificationStateForLog(Context context) {
+        boolean permissionGranted = new PermissionManager(context).grantedNotifications();
+        boolean appEnabled = NotificationManagerCompat.from(context).areNotificationsEnabled();
+        String channelImportance = "not-applicable";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager manager =
+                    (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+            NotificationChannel channel = manager == null
+                    ? null
+                    : manager.getNotificationChannel(CHANNEL_ID);
+            channelImportance = channel == null
+                    ? "missing"
+                    : String.valueOf(channel.getImportance());
+        }
+        return "notificationsVisible=" + canDisplayNotifications(context)
+                + " | permissionGranted=" + permissionGranted
+                + " | appNotificationsEnabled=" + appEnabled
+                + " | channelImportance=" + channelImportance;
+    }
+
+    private void promoteToForeground(ThumbnailRepository.CacheType cacheType,
+                                     int folders, int files) {
+        android.app.Notification notification =
+                buildActiveNotification(cacheType, folders, files);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+        } else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
     }
 
     private static String summaryForLog(GenerationSummary summary) {
@@ -269,24 +438,24 @@ public final class ThumbnailPreGenerationService extends IntentService {
 
     private void updateActiveNotification(ThumbnailRepository.CacheType cacheType,
                                           GenerationSummary summary) {
-        NotificationUtils.createNotification(
-                this,
-                NOTIFICATION_ID,
-                buildActiveNotification(
-                        cacheType,
-                        summary.scannedFolders,
-                        summary.processedFiles()));
+        promoteToForeground(
+                cacheType,
+                summary.scannedFolders,
+                summary.processedFiles());
     }
 
     private android.app.Notification buildActiveNotification(
             ThumbnailRepository.CacheType cacheType, int folders, int files) {
+        String progressText = getString(
+                R.string.thumbnail_recursive_notification_progress,
+                folders,
+                files);
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_streaming)
                 .setContentTitle(getString(getTaskTitle(cacheType)))
-                .setContentText(getString(
-                        R.string.thumbnail_recursive_notification_progress,
-                        folders,
-                        files))
+                .setContentText(progressText)
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(progressText))
+                .setCategory(NotificationCompat.CATEGORY_PROGRESS)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .setOnlyAlertOnce(true)
                 .setOngoing(true)
@@ -327,6 +496,12 @@ public final class ThumbnailPreGenerationService extends IntentService {
                 .setOngoing(false)
                 .setProgress(0, 0, false)
                 .build();
+    }
+
+    private int getCompletionNotificationId(ThumbnailRepository.CacheType cacheType) {
+        return cacheType == ThumbnailRepository.CacheType.IMAGE
+                ? IMAGE_COMPLETION_NOTIFICATION_ID
+                : VIDEO_COMPLETION_NOTIFICATION_ID;
     }
 
     private int getTaskTitle(ThumbnailRepository.CacheType cacheType) {

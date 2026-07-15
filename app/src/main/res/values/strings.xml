@@ -145,6 +145,10 @@
     <string name="pref_locale_restart_notice">Changing the language will take effect after restarting the app</string>
     <string name="use_logs">Log rclone errors</string>
     <string name="use_logs_summary">Error logs will be saved to a local file at (Android/data/de.felixnuesse.extract/files/logs)</string>
+    <string name="use_quarkdav_logs">Log QuarkDAV events</string>
+    <string name="use_quarkdav_logs_summary">Write new QuarkDAV start, stop, runtime output, and failure entries to the sidebar log. Existing entries are kept.</string>
+    <string name="use_thumbnail_logs">Log thumbnail diagnostics</string>
+    <string name="use_thumbnail_logs_summary">Write new thumbnail queue, scan, download, decoding, and generation diagnostics to the sidebar log. Existing entries are kept.</string>
     <string name="notifications_pref_title">Notifications</string>
     <string name="open_notification_settings_title">More notification settings</string>
     <string name="open_notification_settings_summary">Open the settings to further change how we notify you!</string>
@@ -740,6 +744,8 @@
     <string name="thumbnail_recursive_video_action">Recursively generate video thumbnails</string>
     <string name="thumbnail_recursive_image_submitted">Image thumbnail generation task submitted</string>
     <string name="thumbnail_recursive_video_submitted">Video thumbnail generation task submitted</string>
+    <string name="thumbnail_recursive_submission_failed">Unable to start recursive thumbnail generation. Check Thumbnail diagnostics in the sidebar log.</string>
+    <string name="thumbnail_recursive_notification_unavailable">The task started, but notifications are disabled for this app or channel. Progress is still written to Thumbnail diagnostics in the sidebar log.</string>
     <string name="thumbnail_recursive_image_disabled">Enable image thumbnails before starting recursive generation.</string>
     <string name="thumbnail_recursive_video_disabled">Enable video thumbnails before starting recursive generation.</string>
     <string name="thumbnail_recursive_notification_channel_description">Progress for recursive remote thumbnail generation</string>

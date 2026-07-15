@@ -6,13 +6,16 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import ca.pkay.rcloneexplorer.Activities.MainActivity
 import ca.pkay.rcloneexplorer.R
 import ca.pkay.rcloneexplorer.util.SyncLog
@@ -54,11 +57,30 @@ class QuarkDavService : Service() {
     }
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var loggingPreferenceReceiverRegistered = false
+    private val loggingPreferenceReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != QuarkDavServiceActions.ACTION_LOGGING_PREFERENCE_CHANGED) return
+            SyncLog.setQuarkDavLoggingEnabledForCurrentProcess(
+                intent.getBooleanExtra(QuarkDavServiceActions.EXTRA_LOGGING_ENABLED, true),
+            )
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        SyncLog.setQuarkDavLoggingEnabledForCurrentProcess(
+            SyncLog.readQuarkDavLoggingPreference(this),
+        )
+        ContextCompat.registerReceiver(
+            this,
+            loggingPreferenceReceiver,
+            IntentFilter(QuarkDavServiceActions.ACTION_LOGGING_PREFERENCE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        loggingPreferenceReceiverRegistered = true
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.quarkdav_service_starting)))
         supervisor.scheduleAtFixedRate({ heartbeat() }, 45L, 45L, TimeUnit.SECONDS)
@@ -89,6 +111,11 @@ class QuarkDavService : Service() {
         releaseResourceLocks()
         supervisor.shutdownNow()
         ioExecutor.shutdownNow()
+        if (loggingPreferenceReceiverRegistered) {
+            runCatching { unregisterReceiver(loggingPreferenceReceiver) }
+            loggingPreferenceReceiverRegistered = false
+        }
+        SyncLog.clearQuarkDavLoggingOverrideForCurrentProcess()
         super.onDestroy()
     }
 
@@ -212,14 +239,14 @@ class QuarkDavService : Service() {
                                         configuredCookieHash = QuarkDavRepository.cookieFingerprint(holder.config.cookie),
                                     ),
                                 )
-                                SyncLog.info(this, getString(R.string.quarkdav_log_title, holder.config.name), getString(R.string.quarkdav_log_started, url))
+                                SyncLog.quarkDavInfo(this, getString(R.string.quarkdav_log_title, holder.config.name), getString(R.string.quarkdav_log_started, url))
                                 updateNotification()
                             }
                         }
                     } else if (error) {
-                        SyncLog.error(this, getString(R.string.quarkdav_log_title, holder.config.name), line)
+                        SyncLog.quarkDavError(this, getString(R.string.quarkdav_log_title, holder.config.name), line)
                     } else {
-                        SyncLog.info(this, getString(R.string.quarkdav_log_title, holder.config.name), line)
+                        SyncLog.quarkDavInfo(this, getString(R.string.quarkdav_log_title, holder.config.name), line)
                     }
                 }
             }
@@ -242,7 +269,7 @@ class QuarkDavService : Service() {
         } else {
             val message = getString(R.string.quarkdav_process_exited, exitCode)
             QuarkDavStatusStore.write(this, QuarkDavRuntimeStatus(id, QuarkDavRuntimeState.ERROR, message = message))
-            SyncLog.error(this, getString(R.string.quarkdav_log_title, holder.config.name), message)
+            SyncLog.quarkDavError(this, getString(R.string.quarkdav_log_title, holder.config.name), message)
             val attempt = (restartAttempts[id] ?: 0) + 1
             restartAttempts[id] = attempt
             val delay = min(60L, 1L shl min(attempt, 6))
@@ -267,7 +294,7 @@ class QuarkDavService : Service() {
         // state while the process is being removed and terminated.
         holder.stopping.set(true)
         running.remove(id, holder)
-        SyncLog.info(this, getString(R.string.quarkdav_log_title, holder.config.name), getString(R.string.quarkdav_log_stopping, reason))
+        SyncLog.quarkDavInfo(this, getString(R.string.quarkdav_log_title, holder.config.name), getString(R.string.quarkdav_log_stopping, reason))
         runCatching { holder.process.destroy() }
         waitForExit(holder.process, 50, 100L)
         if (isAlive(holder.process)) {
@@ -367,7 +394,7 @@ class QuarkDavService : Service() {
             this,
             QuarkDavRuntimeStatus(remote.id, QuarkDavRuntimeState.ERROR, message = message),
         )
-        SyncLog.error(this, getString(R.string.quarkdav_log_title, remote.name), message)
+        SyncLog.quarkDavError(this, getString(R.string.quarkdav_log_title, remote.name), message)
         updateNotification()
     }
 

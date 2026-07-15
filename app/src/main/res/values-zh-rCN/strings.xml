@@ -133,6 +133,10 @@
     <string name="pref_locale_restart_notice">语言更改将在重新启动应用后生效</string>
     <string name="use_logs">记录 Rclone 错误</string>
     <string name="use_logs_summary">错误日志将会保存到本地文件夹 (Android/data/de.felixnuesse.extract/files/logs)</string>
+    <string name="use_quarkdav_logs">记录 QuarkDAV 日志</string>
+    <string name="use_quarkdav_logs_summary">向侧栏日志写入新的 QuarkDAV 启动、停止、运行输出和错误记录；关闭后不会删除已有记录。</string>
+    <string name="use_thumbnail_logs">记录缩略图诊断日志</string>
+    <string name="use_thumbnail_logs_summary">向侧栏日志写入新的缩略图排队、扫描、下载、解码和生成诊断；关闭后不会删除已有记录。</string>
     <string name="notifications_pref_title">消息通知</string>
     <string name="content_description_circle">圈</string>
     <string name="loading">加载中</string>
@@ -654,6 +658,8 @@
     <string name="thumbnail_recursive_video_action">递归生成视频缩略图</string>
     <string name="thumbnail_recursive_image_submitted">已提交图片缩略图递归生成任务</string>
     <string name="thumbnail_recursive_video_submitted">已提交视频缩略图递归生成任务</string>
+    <string name="thumbnail_recursive_submission_failed">无法启动缩略图递归生成任务，请在侧栏日志的“Thumbnail diagnostics”中查看原因。</string>
+    <string name="thumbnail_recursive_notification_unavailable">任务已启动，但应用通知权限或缩略图通知频道已关闭；进度仍会写入侧栏的“Thumbnail diagnostics”日志。</string>
     <string name="thumbnail_recursive_image_disabled">请先开启图片缩略图全局开关，再执行递归生成。</string>
     <string name="thumbnail_recursive_video_disabled">请先开启视频缩略图全局开关，再执行递归生成。</string>
     <string name="thumbnail_recursive_notification_channel_description">远端缩略图递归生成进度</string>

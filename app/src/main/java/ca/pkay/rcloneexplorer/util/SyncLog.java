@@ -3,6 +3,8 @@ package ca.pkay.rcloneexplorer.util;
 import android.content.Context;
 import android.content.Intent;
 
+import androidx.preference.PreferenceManager;
+
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -26,6 +28,8 @@ import java.util.Iterator;
 import java.util.Locale;
 import java.util.UUID;
 
+import ca.pkay.rcloneexplorer.R;
+
 /**
  * Copyright (C) 2021 Felix Nüsse
  *
@@ -48,6 +52,11 @@ public class SyncLog {
     private static final int RETENTION_DAYS = 31;
     private static final int MAX_READ_ENTRIES = 5000;
     private static final Object PROCESS_LOCK = new Object();
+
+    // QuarkDAV runs in a dedicated Android process. The override is refreshed through a
+    // package-scoped broadcast whenever the user changes the setting, so a running service
+    // does not keep a stale SharedPreferences value until its process is restarted.
+    private static volatile Boolean quarkDavLoggingOverride;
 
     private interface LockedOperation<T> { T run() throws Exception; }
 
@@ -158,6 +167,55 @@ public class SyncLog {
 
     public static long info(Context context, String title, String content) {
         return log(context, title, content, TYPE_INFO);
+    }
+
+    public static boolean readQuarkDavLoggingPreference(Context context) {
+        Context app = context.getApplicationContext();
+        return PreferenceManager.getDefaultSharedPreferences(app).getBoolean(
+                app.getString(R.string.pref_key_quarkdav_logs), true);
+    }
+
+    public static boolean isQuarkDavLoggingEnabled(Context context) {
+        Boolean override = quarkDavLoggingOverride;
+        return override != null ? override : readQuarkDavLoggingPreference(context);
+    }
+
+    public static void setQuarkDavLoggingEnabledForCurrentProcess(boolean enabled) {
+        quarkDavLoggingOverride = enabled;
+    }
+
+    public static void clearQuarkDavLoggingOverrideForCurrentProcess() {
+        quarkDavLoggingOverride = null;
+    }
+
+    public static boolean isThumbnailLoggingEnabled(Context context) {
+        Context app = context.getApplicationContext();
+        return PreferenceManager.getDefaultSharedPreferences(app).getBoolean(
+                app.getString(R.string.pref_key_thumbnail_logs), true);
+    }
+
+    public static long quarkDavError(Context context, String title, String content) {
+        return isQuarkDavLoggingEnabled(context)
+                ? error(context, title, content)
+                : -1L;
+    }
+
+    public static long quarkDavInfo(Context context, String title, String content) {
+        return isQuarkDavLoggingEnabled(context)
+                ? info(context, title, content)
+                : -1L;
+    }
+
+    public static long thumbnailError(Context context, String title, String content) {
+        return isThumbnailLoggingEnabled(context)
+                ? error(context, title, content)
+                : -1L;
+    }
+
+    public static long thumbnailInfo(Context context, String title, String content) {
+        return isThumbnailLoggingEnabled(context)
+                ? info(context, title, content)
+                : -1L;
     }
 
     public static void delete(Context context) {

@@ -1579,14 +1579,28 @@ public class FileExplorerFragment extends Fragment implements   FileExplorerRecy
             return;
         }
 
-        Intent intent = new Intent(context, ThumbnailPreGenerationService.class);
-        intent.putExtra(ThumbnailPreGenerationService.REMOTE_ARG, remote);
-        intent.putExtra(
-                ThumbnailPreGenerationService.DIRECTORY_PATH_ARG,
-                rootPath);
-        intent.putExtra(ThumbnailPreGenerationService.START_AT_ROOT_ARG, startAtRoot);
-        intent.putExtra(ThumbnailPreGenerationService.CACHE_TYPE_ARG, cacheType.name());
-        tryStartService(context, intent);
+        ThumbnailPreGenerationService.EnqueueResult enqueueResult =
+                ThumbnailPreGenerationService.enqueue(
+                        context, remote, rootPath, startAtRoot, cacheType);
+        if (enqueueResult == ThumbnailPreGenerationService.EnqueueResult.FAILED) {
+            Toasty.error(
+                    context,
+                    getString(R.string.thumbnail_recursive_submission_failed),
+                    Toast.LENGTH_LONG,
+                    true).show();
+            return;
+        }
+
+        if (enqueueResult
+                == ThumbnailPreGenerationService.EnqueueResult
+                .STARTED_WITHOUT_VISIBLE_NOTIFICATIONS) {
+            Toasty.warning(
+                    context,
+                    getString(R.string.thumbnail_recursive_notification_unavailable),
+                    Toast.LENGTH_LONG,
+                    true).show();
+            return;
+        }
 
         int submittedMessage = cacheType == ThumbnailRepository.CacheType.IMAGE
                 ? R.string.thumbnail_recursive_image_submitted

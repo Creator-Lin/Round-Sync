@@ -11,7 +11,10 @@ object QuarkDavServiceActions {
     const val ACTION_STOP_REMOTE = "ca.pkay.rcloneexplorer.quarkdav.STOP_REMOTE"
     const val ACTION_STOP_ALL = "ca.pkay.rcloneexplorer.quarkdav.STOP_ALL"
     const val ACTION_BOOT_RECONCILE = "ca.pkay.rcloneexplorer.quarkdav.BOOT_RECONCILE"
+    const val ACTION_LOGGING_PREFERENCE_CHANGED =
+        "ca.pkay.rcloneexplorer.quarkdav.LOGGING_PREFERENCE_CHANGED"
     const val EXTRA_REMOTE_ID = "remote_id"
+    const val EXTRA_LOGGING_ENABLED = "logging_enabled"
 
     fun startRemote(context: Context, id: String) {
         QuarkDavRepository.setEnabled(context, id, true)
@@ -49,13 +52,23 @@ object QuarkDavServiceActions {
         send(context, Intent(context, QuarkDavService::class.java).setAction(ACTION_STOP_ALL))
     }
 
+    /** Updates a currently running :quarkdav process without starting the service. */
+    fun notifyLoggingPreferenceChanged(context: Context, enabled: Boolean) {
+        val app = context.applicationContext
+        app.sendBroadcast(
+            Intent(ACTION_LOGGING_PREFERENCE_CHANGED)
+                .setPackage(app.packageName)
+                .putExtra(EXTRA_LOGGING_ENABLED, enabled),
+        )
+    }
+
     private fun send(context: Context, intent: Intent) {
         val app = context.applicationContext
         runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) app.startForegroundService(intent) else app.startService(intent)
         }.onFailure { error ->
             val message = app.getString(R.string.quarkdav_service_start_failed, error.message ?: error.javaClass.simpleName)
-            SyncLog.error(app, app.getString(R.string.quarkdav_title), message)
+            SyncLog.quarkDavError(app, app.getString(R.string.quarkdav_title), message)
             intent.getStringExtra(EXTRA_REMOTE_ID)?.let { id ->
                 QuarkDavStatusStore.write(app, QuarkDavRuntimeStatus(id, QuarkDavRuntimeState.ERROR, message = message))
             }
