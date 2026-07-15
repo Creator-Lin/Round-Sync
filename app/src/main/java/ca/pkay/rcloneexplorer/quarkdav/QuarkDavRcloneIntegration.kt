@@ -58,7 +58,7 @@ object QuarkDavRcloneIntegration {
             throw interrupted
         }
         if (exitCode != 0) {
-            val errorText = runCatching { process.errorStream.bufferedReader().readText().trim() }.getOrDefault("")
+            val errorText = rclone.getCollectedErrorOutput(process).trim()
             error(
                 if (errorText.isBlank()) {
                     app.getString(R.string.quarkdav_rclone_config_exit, exitCode)

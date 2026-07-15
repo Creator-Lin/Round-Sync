@@ -36,16 +36,16 @@ public class RemoteConfigHelper {
     public static void updateAndWait(Context context, ArrayList<String> options) {
         Rclone rclone = new Rclone(context);
         Process process = rclone.configUpdate(options);
-        rcloneRun(process, context, options);
+        rcloneRun(rclone, process, context, options);
     }
 
     public static void setupAndWait(Context context, ArrayList<String> options) {
         Rclone rclone = new Rclone(context);
         Process process = rclone.configCreate(options);
-        rcloneRun(process, context, options);
+        rcloneRun(rclone, process, context, options);
     }
 
-    private static void rcloneRun(Process process, Context context, ArrayList<String> options) {
+    private static void rcloneRun(Rclone rclone, Process process, Context context, ArrayList<String> options) {
         if (null == process) {
             Toasty.error(context, context.getString(R.string.error_creating_remote), Toast.LENGTH_SHORT, true).show();
             return;
@@ -63,6 +63,7 @@ public class RemoteConfigHelper {
             }
         }
         if (0 != exitCode) {
+            rclone.logErrorOutput(process);
             Toasty.error(context, context.getString(R.string.error_creating_remote), Toast.LENGTH_SHORT, true).show();
         } else {
             Toasty.success(context, context.getString(R.string.remote_creation_success), Toast.LENGTH_SHORT, true).show();

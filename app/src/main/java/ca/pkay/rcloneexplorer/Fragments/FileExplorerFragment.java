@@ -2250,6 +2250,9 @@ public class FileExplorerFragment extends Fragment implements   FileExplorerRecy
             fileLocation = saveLocation + "/" + fileItem.getName();
 
             process = rclone.downloadFile(remote, fileItem, saveLocation);
+            if (process != null) {
+                rclone.startErrorOutputDrainer(process, "download");
+            }
 
             if (process != null) {
                 try {

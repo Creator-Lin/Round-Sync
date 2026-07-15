@@ -1253,6 +1253,7 @@ public class MainActivity extends AppCompatActivity
             try {
                 process.waitFor();
                 if (process.exitValue() != 0) {
+                    rclone.logErrorOutput(process);
                     FLog.w(TAG, "addLocalRemote: process error");
                     return;
                 }

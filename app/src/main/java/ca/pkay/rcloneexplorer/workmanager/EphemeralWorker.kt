@@ -17,7 +17,6 @@ import androidx.work.Worker
 import androidx.work.WorkerParameters
 import ca.pkay.rcloneexplorer.Items.FileItem
 import ca.pkay.rcloneexplorer.Items.RemoteItem
-import ca.pkay.rcloneexplorer.Log2File
 import ca.pkay.rcloneexplorer.R
 import ca.pkay.rcloneexplorer.Rclone
 import ca.pkay.rcloneexplorer.notifications.prototypes.WorkerNotification
@@ -57,6 +56,8 @@ class EphemeralWorker (private var mContext: Context, workerParams: WorkerParame
         const val MOVE_TARGETPATH = "MOVE_TARGETPATH"
 
         const val DELETE_FILE = "DELETE_FILE"
+
+        private const val MAX_RCLONE_ERROR_CAPTURE_CHARS = 128 * 1024
     }
 
     internal enum class FAILURE_REASON {
@@ -68,11 +69,7 @@ class EphemeralWorker (private var mContext: Context, workerParams: WorkerParame
     private val mPreferences = PreferenceManager.getDefaultSharedPreferences(mContext)
 
 
-    private var log2File: Log2File? = null
-
-
     // States
-    private val sIsLoggingEnabled = mPreferences.getBoolean(getString(R.string.pref_key_logs), false)
     private var sConnectivityChanged = false
 
     private var sRcloneProcess: Process? = null
@@ -207,49 +204,90 @@ class EphemeralWorker (private var mContext: Context, workerParams: WorkerParame
     private fun handleSync(title: String) {
         if (sRcloneProcess != null) {
             val localProcessReference = sRcloneProcess!!
+            val rcloneErrors = StringBuilder()
+            val unstructuredStderr = StringBuilder()
+            var rcloneErrorsTruncated = false
+            var unstructuredTruncated = false
             try {
-                val reader = BufferedReader(InputStreamReader(localProcessReference.errorStream))
-                val iterator = reader.lineSequence().iterator()
-                while(iterator.hasNext()) {
-                    val line = iterator.next()
-                    try {
-                        val logline = JSONObject(line)
-                        //todo: migrate this to StatusObject, so that we can handle everything properly.
-                        if (logline.getString("level") == "error") {
-                            if (sIsLoggingEnabled) {
-                                log2File?.log(line)
+                BufferedReader(InputStreamReader(localProcessReference.errorStream)).use { reader ->
+                    val iterator = reader.lineSequence().iterator()
+                    while (iterator.hasNext()) {
+                        val line = iterator.next()
+                        try {
+                            val logline = JSONObject(line)
+                            // todo: migrate this to StatusObject, so that we can handle everything properly.
+                            if (logline.getString("level") == "error") {
+                                rcloneErrorsTruncated = appendBoundedRcloneError(rcloneErrors, line) || rcloneErrorsTruncated
+                                statusObject.parseLoglineToStatusObject(logline)
+                            } else if (logline.getString("level") == "warning") {
+                                statusObject.parseLoglineToStatusObject(logline)
                             }
-                            statusObject.parseLoglineToStatusObject(logline)
-                        } else if (logline.getString("level") == "warning") {
-                            statusObject.parseLoglineToStatusObject(logline)
-                        }
 
-                        updateForegroundNotification(mNotificationManager?.updateNotification(
+                            updateForegroundNotification(mNotificationManager?.updateNotification(
                             title,
                             statusObject.notificationContent,
                             statusObject.notificationBigText,
                             statusObject.notificationPercent,
                             ongoingNotificationID
                         ))
-                    } catch (e: JSONException) {
-                        Log.e(tag(), "Error: the offending line: $line")
-                        //FLog.e(TAG, "onHandleIntent: error reading json", e)
+                        } catch (e: JSONException) {
+                            FLog.e(tag(), "Rclone stderr was not valid JSON: $line")
+                            unstructuredTruncated = appendBoundedRcloneError(unstructuredStderr, line) || unstructuredTruncated
+                        }
                     }
                 }
             } catch (e: InterruptedIOException) {
-                FLog.e(tag(), "onHandleIntent: I/O interrupted, stream closed", e)
+                FLog.e(tag(), "Rclone stderr drain interrupted, stream closed", e)
             } catch (e: IOException) {
-                FLog.e(tag(), "onHandleIntent: error reading stdout", e)
+                FLog.e(tag(), "Error draining rclone stderr", e)
             }
+
+            var exitCode: Int? = null
             try {
-                localProcessReference.waitFor()
+                exitCode = localProcessReference.waitFor()
             } catch (e: InterruptedException) {
-                FLog.e(tag(), "onHandleIntent: error waiting for process", e)
+                Thread.currentThread().interrupt()
+                FLog.e(tag(), "Interrupted while waiting for rclone", e)
+            }
+
+            if (exitCode != null && exitCode != 0 && failureReason == FAILURE_REASON.NO_FAILURE) {
+                failureReason = FAILURE_REASON.RCLONE_ERROR
+            }
+
+            if (rcloneErrors.isNotEmpty() || (exitCode != null && exitCode != 0)) {
+                val details = buildString {
+                    append("Exit code: ").append(exitCode ?: "unknown")
+                    if (rcloneErrors.isNotEmpty()) {
+                        append("\n\nstderr error entries:\n")
+                        if (rcloneErrorsTruncated) {
+                            append("[Earlier stderr error entries truncated]\n")
+                        }
+                        append(rcloneErrors.toString().trim())
+                    }
+                    if (exitCode != null && exitCode != 0 && unstructuredStderr.isNotEmpty()) {
+                        append("\n\nunstructured stderr:\n")
+                        if (unstructuredTruncated) {
+                            append("[Earlier unstructured stderr truncated]\n")
+                        }
+                        append(unstructuredStderr.toString().trim())
+                    }
+                }
+                SyncLog.rcloneErrorAsync(mContext, "transfer", details)
             }
         } else {
             log("Sync: No Rclone Process!")
         }
         mNotificationManager?.cancelSyncNotification(ongoingNotificationID)
+    }
+
+    private fun appendBoundedRcloneError(buffer: StringBuilder, line: String): Boolean {
+        buffer.append(line).append('\n')
+        val overflow = buffer.length - MAX_RCLONE_ERROR_CAPTURE_CHARS
+        if (overflow <= 0) {
+            return false
+        }
+        buffer.delete(0, overflow)
+        return true
     }
 
     private fun postSync() {

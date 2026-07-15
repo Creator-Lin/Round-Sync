@@ -86,7 +86,7 @@ public class OauthHelper {
         // Since authorization uses a fixed port, shut down previous attempt.
         oauthProcessToken.forceRelease();
 
-        Process process = rclone.configCreate(options);
+        Process process = rclone.configCreateInteractive(options);
         if (null == process) {
             return false;
         }

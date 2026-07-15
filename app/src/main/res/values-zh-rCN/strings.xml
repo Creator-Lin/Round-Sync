@@ -132,7 +132,9 @@
     <string name="pref_locale_dlg_title">选择语言</string>
     <string name="pref_locale_restart_notice">语言更改将在重新启动应用后生效</string>
     <string name="use_logs">记录 Rclone 错误</string>
-    <string name="use_logs_summary">错误日志将会保存到本地文件夹 (Android/data/de.felixnuesse.extract/files/logs)</string>
+    <string name="use_logs_summary">始终持续排空 Rclone 的 stderr，避免子进程管道阻塞。开启后会把失败命令详情写入侧栏日志；此选项不会启用 -vvv 详细输出。</string>
+    <string name="rclone_log_title">Rclone 错误</string>
+    <string name="rclone_log_operation">操作：%1$s</string>
     <string name="use_quarkdav_logs">记录 QuarkDAV 日志</string>
     <string name="use_quarkdav_logs_summary">向侧栏日志写入新的 QuarkDAV 启动、停止、运行输出和错误记录；关闭后不会删除已有记录。</string>
     <string name="use_thumbnail_logs">记录缩略图诊断日志</string>
@@ -603,7 +605,7 @@
 
     <string name="action_clear_logs">清空日志</string>
     <string name="action_follow_latest_logs">追踪最新日志</string>
-    <string name="confirm_clear_logs">删除全部 Round-Sync 与 QuarkDav 日志？</string>
+    <string name="confirm_clear_logs">删除全部 Round-Sync、Rclone 与 QuarkDav 日志？</string>
     <string name="quarkdav_service_start_failed">无法启动 QuarkDav 后台服务：%1$s</string>
 
     <string name="view_mode">查看方式</string>

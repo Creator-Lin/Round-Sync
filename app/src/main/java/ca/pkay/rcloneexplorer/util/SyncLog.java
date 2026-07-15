@@ -27,6 +27,9 @@ import java.util.Date;
 import java.util.Iterator;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import ca.pkay.rcloneexplorer.R;
 
@@ -52,6 +55,18 @@ public class SyncLog {
     private static final int RETENTION_DAYS = 31;
     private static final int MAX_READ_ENTRIES = 5000;
     private static final Object PROCESS_LOCK = new Object();
+    private static final ThreadPoolExecutor RCLONE_LOG_WRITER = new ThreadPoolExecutor(
+            1,
+            1,
+            0L,
+            TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(128),
+            runnable -> {
+                Thread thread = new Thread(runnable, "rclone-sidebar-log");
+                thread.setDaemon(true);
+                return thread;
+            },
+            new ThreadPoolExecutor.DiscardOldestPolicy());
 
     // QuarkDAV runs in a dedicated Android process. The override is refreshed through a
     // package-scoped broadcast whenever the user changes the setting, so a running service
@@ -188,10 +203,43 @@ public class SyncLog {
         quarkDavLoggingOverride = null;
     }
 
+    public static boolean isRcloneLoggingEnabled(Context context) {
+        Context app = context.getApplicationContext();
+        return PreferenceManager.getDefaultSharedPreferences(app).getBoolean(
+                app.getString(R.string.pref_key_logs), false);
+    }
+
     public static boolean isThumbnailLoggingEnabled(Context context) {
         Context app = context.getApplicationContext();
         return PreferenceManager.getDefaultSharedPreferences(app).getBoolean(
                 app.getString(R.string.pref_key_thumbnail_logs), true);
+    }
+
+    public static long rcloneError(Context context, String operation, String content) {
+        if (!isRcloneLoggingEnabled(context)) {
+            return -1L;
+        }
+        Context app = context.getApplicationContext();
+        StringBuilder details = new StringBuilder();
+        if (operation != null && !operation.trim().isEmpty()) {
+            details.append(app.getString(R.string.rclone_log_operation, operation.trim()))
+                    .append('\n');
+        }
+        details.append(content == null ? "" : content);
+        return error(app, app.getString(R.string.rclone_log_title), details.toString().trim());
+    }
+
+    /**
+     * Queues a sidebar rclone error without slowing the thread that is draining subprocess
+     * stderr. The queue is bounded so a pathological error storm cannot grow memory without
+     * limit; when full, the oldest pending entry is discarded in favour of the newest one.
+     */
+    public static void rcloneErrorAsync(Context context, String operation, String content) {
+        Context app = context.getApplicationContext();
+        if (!isRcloneLoggingEnabled(app)) {
+            return;
+        }
+        RCLONE_LOG_WRITER.execute(() -> rcloneError(app, operation, content));
     }
 
     public static long quarkDavError(Context context, String title, String content) {

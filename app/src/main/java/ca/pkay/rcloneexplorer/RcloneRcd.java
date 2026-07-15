@@ -68,8 +68,8 @@ public class RcloneRcd {
     private static String rcPass = initPass();
 
     private final Context context;
-    //private final Log2File log2File;
     private final ObjectMapper mapper;
+    private final Rclone rcloneProcessLogger;
 
     private final String configPath;
     private final String rclone;
@@ -100,6 +100,7 @@ public class RcloneRcd {
         configPath = context.getFilesDir().getPath() + "/rclone.conf";
         rclone = context.getApplicationInfo().nativeLibraryDir + "/librclone.so";
         mapper = new ObjectMapper();
+        rcloneProcessLogger = new Rclone(context.getApplicationContext());
         mapper.configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
         mapper.setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.NON_PRIVATE);
         pendingJobs = new LinkedBlockingQueue<>();
@@ -116,24 +117,16 @@ public class RcloneRcd {
             FLog.d(TAG, "startRcd: starting rclone process");
             port = nextAvailablePort();
             String addr = "localhost:" + port;
-            String tmpDir = context.getCacheDir().getAbsolutePath();
-            String logFile = context.getExternalFilesDir("logs").getAbsolutePath() + "/rcd.log";
-            SharedPreferences pref = PreferenceManager.getDefaultSharedPreferences(context);
             ArrayList<String> parameters = new ArrayList<>(Arrays.asList(
                     rclone,
                     "--config", configPath,
                     "--rc-addr", addr,
                     "--rc-user", rcUser,
                     "--rc-pass", rcPass,
-                    "--rc-serve"));
-            if (pref.getBoolean(context.getString(R.string.pref_key_logs), false)) {
-                parameters.addAll(Arrays.asList(
-                        "--log-file", logFile,
-                        "--dump", "headers",
-                        "-vvv"));
-            }
-            parameters.add("rcd");
+                    "--rc-serve",
+                    "rcd"));
             rcd = Runtime.getRuntime().exec(parameters.toArray(new String[0]), getEnv());
+            rcloneProcessLogger.startErrorOutputDrainer(rcd, "rcd");
         } catch (IOException e) {
             FLog.e(TAG, "startRcd: error", e);
             throw new RuntimeException(e);

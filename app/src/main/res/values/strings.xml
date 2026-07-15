@@ -144,7 +144,9 @@
     <string name="pref_locale_dlg_title">Select Language</string>
     <string name="pref_locale_restart_notice">Changing the language will take effect after restarting the app</string>
     <string name="use_logs">Log rclone errors</string>
-    <string name="use_logs_summary">Error logs will be saved to a local file at (Android/data/de.felixnuesse.extract/files/logs)</string>
+    <string name="use_logs_summary">Rclone stderr is always drained continuously to prevent subprocess stalls. When enabled, failed command details are added to the sidebar log. This option does not enable verbose -vvv output.</string>
+    <string name="rclone_log_title">Rclone error</string>
+    <string name="rclone_log_operation">Operation: %1$s</string>
     <string name="use_quarkdav_logs">Log QuarkDAV events</string>
     <string name="use_quarkdav_logs_summary">Write new QuarkDAV start, stop, runtime output, and failure entries to the sidebar log. Existing entries are kept.</string>
     <string name="use_thumbnail_logs">Log thumbnail diagnostics</string>
@@ -730,7 +732,7 @@
 
     <string name="action_clear_logs">Clear logs</string>
     <string name="action_follow_latest_logs">Follow latest logs</string>
-    <string name="confirm_clear_logs">Delete all Round-Sync and QuarkDav logs?</string>
+    <string name="confirm_clear_logs">Delete all Round-Sync, Rclone, and QuarkDav logs?</string>
     <string name="quarkdav_service_start_failed">Unable to start the QuarkDav background service: %1$s</string>
 
     <string name="view_mode">View</string>

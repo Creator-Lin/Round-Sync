@@ -39,7 +39,9 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -56,6 +58,7 @@ import ca.pkay.rcloneexplorer.quarkdav.QuarkDavRepository;
 import ca.pkay.rcloneexplorer.rclone.Provider;
 import ca.pkay.rcloneexplorer.rclone.RemoteReferenceParser;
 import ca.pkay.rcloneexplorer.util.FLog;
+import ca.pkay.rcloneexplorer.util.SyncLog;
 import es.dmoral.toasty.Toasty;
 import io.github.x0b.safdav.SafAccessProvider;
 import io.github.x0b.safdav.SafDAVServer;
@@ -65,6 +68,8 @@ public class Rclone {
 
     private static final String TAG = "Rclone";
     private static final AtomicLong RCLONE_CAT_STREAM_SEQUENCE = new AtomicLong();
+    private static final AtomicLong RCLONE_STDERR_SEQUENCE = new AtomicLong();
+    private static final int MAX_RCLONE_STDERR_CAPTURE_CHARS = 128 * 1024;
     public static final int SYNC_DIRECTION_LOCAL_TO_REMOTE = 1;
     public static final int SYNC_DIRECTION_REMOTE_TO_LOCAL = 2;
     public static final int SERVE_PROTOCOL_HTTP = 1;
@@ -78,13 +83,13 @@ public class Rclone {
     private Context context;
     private String rclone;
     private String rcloneConf;
-    private Log2File log2File;
+    private final Map<Process, RcloneErrorCollector> errorCollectors =
+            Collections.synchronizedMap(new WeakHashMap<>());
 
     public Rclone(Context context) {
         this.context = context;
         this.rclone = context.getApplicationInfo().nativeLibraryDir + "/librclone.so";
         this.rcloneConf = context.getFilesDir().getPath() + "/rclone.conf";
-        log2File = new Log2File(context);
     }
 
     private String[] createCommand(ArrayList<String> args) {
@@ -95,19 +100,11 @@ public class Rclone {
         return command;
     }
     private String[] createCommand(String ...args) {
-        boolean loggingEnabled = PreferenceManager
-                .getDefaultSharedPreferences(context)
-                .getBoolean(context.getString(R.string.pref_key_logs), false);
         ArrayList<String> command = new ArrayList<>();
 
         command.add(rclone);
         command.add("--config");
         command.add(rcloneConf);
-
-        if(loggingEnabled) {
-            command.add("-vvv");
-        }
-
         command.addAll(Arrays.asList(args));
         return createCommand(command);
     }
@@ -118,9 +115,6 @@ public class Rclone {
     }
 
     private String[] createCommandWithOptions(ArrayList<String> args) {
-        boolean loggingEnabled = PreferenceManager
-                .getDefaultSharedPreferences(context)
-                .getBoolean(context.getString(R.string.pref_key_logs), false);
         ArrayList<String> command = new ArrayList<>();
 
         String cachePath = context.getCacheDir().getAbsolutePath();
@@ -148,10 +142,6 @@ public class Rclone {
 
         command.add("--config");
         command.add(rcloneConf);
-
-        if(loggingEnabled) {
-            command.add("-vvv");
-        }
 
         command.addAll(args);
         return createCommand(command);
@@ -204,34 +194,182 @@ public class Rclone {
         return environmentValues.toArray(new String[0]);
     }
 
+    /**
+     * Ensures stderr is consumed concurrently and records a failed rclone command when the
+     * "Log rclone errors" preference is enabled. Draining is unconditional; the preference only
+     * controls persistence to the sidebar log.
+     */
+    public void startErrorOutputDrainer(Process process, String operation) {
+        startErrorOutputDrainer(process, operation, true);
+    }
+
+    private void startErrorOutputDrainer(Process process, String operation,
+            boolean recordFailure) {
+        if (process == null) {
+            return;
+        }
+        synchronized (errorCollectors) {
+            if (errorCollectors.containsKey(process)) {
+                return;
+            }
+            long sequence = RCLONE_STDERR_SEQUENCE.incrementAndGet();
+            String normalizedOperation = operation == null || operation.trim().isEmpty()
+                    ? "command"
+                    : operation.trim();
+            RcloneErrorCollector collector = new RcloneErrorCollector(process, normalizedOperation, recordFailure);
+            errorCollectors.put(process, collector);
+            collector.start("rclone-stderr-" + sequence);
+        }
+    }
+
     public void logErrorOutput(Process process) {
         if (process == null) {
             return;
         }
+        RcloneErrorCollector collector;
+        synchronized (errorCollectors) {
+            collector = errorCollectors.get(process);
+        }
+        if (collector == null) {
+            startErrorOutputDrainer(process, "command");
+            synchronized (errorCollectors) {
+                collector = errorCollectors.get(process);
+            }
+        }
+        if (collector != null) {
+            collector.awaitCompletion();
+            collector.logFailureIfNeeded();
+        }
+    }
 
-        SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context);
-        boolean isLoggingEnable = sharedPreferences.getBoolean(context.getString(R.string.pref_key_logs), false);
-        if (!isLoggingEnable) {
-            return;
+    /** Returns the bounded stderr tail collected by a previously started drainer. */
+    public String getCollectedErrorOutput(Process process) {
+        if (process == null) {
+            return "";
+        }
+        RcloneErrorCollector collector;
+        synchronized (errorCollectors) {
+            collector = errorCollectors.get(process);
+        }
+        if (collector == null) {
+            startErrorOutputDrainer(process, "command");
+            synchronized (errorCollectors) {
+                collector = errorCollectors.get(process);
+            }
+        }
+        return collector == null ? "" : collector.awaitCompletion();
+    }
+
+    private boolean isRcloneErrorLoggingEnabled() {
+        return PreferenceManager.getDefaultSharedPreferences(context).getBoolean(
+                context.getString(R.string.pref_key_logs), false);
+    }
+
+    private final class RcloneErrorCollector implements Runnable {
+        private Process process;
+        private final String operation;
+        private final boolean recordFailure;
+        private final StringBuilder stderrTail = new StringBuilder();
+        private final AtomicBoolean logged = new AtomicBoolean();
+        private boolean truncated;
+        private boolean finished;
+        private int exitCode = Integer.MIN_VALUE;
+
+        private RcloneErrorCollector(Process process, String operation, boolean recordFailure) {
+            this.process = process;
+            this.operation = operation;
+            this.recordFailure = recordFailure;
         }
 
-        StringBuilder stringBuilder = new StringBuilder(100);
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                stringBuilder.append(line).append("\n");
-            }
-        } catch (InterruptedIOException iioe) {
-            FLog.i(TAG, "logErrorOutput: process died while reading. Log may be incomplete.");
-        } catch (IOException e) {
-            if("Stream closed".equals(e.getMessage())) {
-                FLog.d(TAG, "logErrorOutput: could not read stderr, process stream is already closed");
-            } else {
-                FLog.e(TAG, "logErrorOutput: ", e);
-            }
-            return;
+        private void start(String threadName) {
+            Thread thread = new Thread(this, threadName);
+            thread.setDaemon(true);
+            thread.start();
         }
-        log2File.log(stringBuilder.toString());
+
+        @Override
+        public void run() {
+            Process runningProcess = process;
+            try (Reader reader = new InputStreamReader(runningProcess.getErrorStream(),
+                    StandardCharsets.UTF_8)) {
+                char[] buffer = new char[4096];
+                int charsRead;
+                while ((charsRead = reader.read(buffer)) != -1) {
+                    appendBounded(buffer, charsRead);
+                }
+            } catch (InterruptedIOException e) {
+                FLog.i(TAG, "Rclone stderr drain interrupted for " + operation);
+            } catch (IOException e) {
+                if ("Stream closed".equals(e.getMessage())) {
+                    FLog.d(TAG, "Rclone stderr stream already closed for " + operation);
+                } else {
+                    FLog.e(TAG, "Could not drain rclone stderr for " + operation, e);
+                }
+            } finally {
+                try {
+                    exitCode = runningProcess.waitFor();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    try {
+                        exitCode = runningProcess.exitValue();
+                    } catch (IllegalThreadStateException ignored) {
+                        exitCode = Integer.MIN_VALUE;
+                    }
+                }
+                synchronized (this) {
+                    finished = true;
+                    process = null;
+                    notifyAll();
+                }
+                logFailureIfNeeded();
+            }
+        }
+
+        private void appendBounded(char[] buffer, int charsRead) {
+            stderrTail.append(buffer, 0, charsRead);
+            int overflow = stderrTail.length() - MAX_RCLONE_STDERR_CAPTURE_CHARS;
+            if (overflow > 0) {
+                stderrTail.delete(0, overflow);
+                truncated = true;
+            }
+        }
+
+        private String awaitCompletion() {
+            boolean interrupted = false;
+            synchronized (this) {
+                while (!finished) {
+                    try {
+                        wait();
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            String output = stderrTail.toString().trim();
+            if (truncated && !output.isEmpty()) {
+                output = "[Earlier stderr output truncated]\n" + output;
+            }
+            return output;
+        }
+
+        private void logFailureIfNeeded() {
+            if (!recordFailure || exitCode == 0 || exitCode == Integer.MIN_VALUE
+                    || !isRcloneErrorLoggingEnabled()
+                    || !logged.compareAndSet(false, true)) {
+                return;
+            }
+            String output = awaitCompletion();
+            StringBuilder details = new StringBuilder()
+                    .append("Exit code: ").append(exitCode);
+            if (!output.isEmpty()) {
+                details.append("\n\nstderr:\n").append(output);
+            }
+            String message = details.toString();
+            SyncLog.rcloneErrorAsync(context, operation, message);
+        }
     }
 
     @Nullable
@@ -419,14 +557,66 @@ public class Rclone {
         return getRuntimeProcess(command, new String[0]);
     }
 
+    /** Starts an rclone process and immediately drains stderr on a dedicated daemon thread. */
     private Process getRuntimeProcess(String[] command, String[] env) throws IOException {
-        try{
-            Runtime.getRuntime().exec(rclone);
-        } catch (IOException e){
-            FLog.e("rclone", "Error executing rclone!" +e.getMessage());
-            throw new IOException("Error executing rclone!" +e.getMessage());
+        Process process = getRuntimeProcessRaw(command, env);
+        startErrorOutputDrainer(process, describeRcloneOperation(command));
+        return process;
+    }
+
+    private Process getRuntimeProcessWithoutFailureLog(String[] command) throws IOException {
+        Process process = getRuntimeProcessRaw(command);
+        startErrorOutputDrainer(process, describeRcloneOperation(command), false);
+        return process;
+    }
+
+    /**
+     * Starts a process without consuming stderr. Use only when the caller must parse stderr live
+     * (for example JSON transfer progress, OAuth prompts, or an interactive config recipe).
+     */
+    private Process getRuntimeProcessRaw(String[] command, String[] env) throws IOException {
+        try {
+            return Runtime.getRuntime().exec(command, env);
+        } catch (IOException e) {
+            FLog.e(TAG, "Error executing rclone", e);
+            throw new IOException("Error executing rclone: " + e.getMessage(), e);
         }
-        return Runtime.getRuntime().exec(command, env);
+    }
+
+    private Process getRuntimeProcessRaw(String[] command) throws IOException {
+        return getRuntimeProcessRaw(command, new String[0]);
+    }
+
+    private String describeRcloneOperation(String[] command) {
+        for (String argument : command) {
+            if ("--version".equals(argument)) {
+                return "version";
+            }
+            switch (argument) {
+                case "lsjson":
+                case "config":
+                case "obscure":
+                case "serve":
+                case "sync":
+                case "copy":
+                case "purge":
+                case "deletefile":
+                case "mkdir":
+                case "moveto":
+                case "cat":
+                case "rcat":
+                case "cleanup":
+                case "link":
+                case "md5sum":
+                case "sha1sum":
+                case "about":
+                case "listremotes":
+                    return argument;
+                default:
+                    break;
+            }
+        }
+        return "command";
     }
 
     private boolean isWrappingRemoteType(String type) {
@@ -538,19 +728,36 @@ public class Rclone {
 
     @Nullable
     public Process configCreate(List<String> options) {
+        return configCreate(options, false);
+    }
+
+    /**
+     * Starts config create without attaching the generic stderr drainer. OAuth setup owns stderr
+     * so it can discover the authorization URL while rclone is still running.
+     */
+    @Nullable
+    public Process configCreateInteractive(List<String> options) {
+        return configCreate(options, true);
+    }
+
+    private Process configCreate(List<String> options, boolean callerReadsStderr) {
         // https://rclone.org/commands/rclone_config_create/
         // See the NB-comment why we need to pass --obscure.
         // Otherwise long passwords fail.
         options.add("--obscure");
-        return config("create" , options);
+        return config("create", options, callerReadsStderr);
     }
 
     @Nullable
     public Process configUpdate(List<String> options) {
         return configCreate(options);
     }
-    
+
     public Process config(String task, List<String> options) {
+        return config(task, options, false);
+    }
+
+    private Process config(String task, List<String> options, boolean callerReadsStderr) {
         String[] command = createCommand("config", task);
         String[] opt = options.toArray(new String[0]);
         String[] commandWithOptions = new String[command.length + options.size()];
@@ -560,7 +767,9 @@ public class Rclone {
         System.arraycopy(opt, 0, commandWithOptions, command.length, opt.length);
 
         try {
-            return getRuntimeProcess(commandWithOptions);
+            return callerReadsStderr
+                    ? getRuntimeProcessRaw(commandWithOptions)
+                    : getRuntimeProcess(commandWithOptions);
         } catch (IOException e) {
             FLog.e(TAG, "configCreate: error starting rclone", e);
             return null;
@@ -611,7 +820,7 @@ public class Rclone {
     public Process configInteractive() throws IOException {
         String[] command = createCommand("config");
         String[] environment = getRcloneEnv();
-        return getRuntimeProcess(command, environment);
+        return getRuntimeProcessRaw(command, environment);
     }
 
     public void deleteRemote(String remoteName) {
@@ -716,14 +925,6 @@ public class Rclone {
             params.add(baseUrl);
         }
 
-        SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context);
-        boolean isLoggingEnabled = sharedPreferences.getBoolean(context.getString(R.string.pref_key_logs), false);
-        if (isLoggingEnabled) {
-            File serveLog = new File(context.getExternalFilesDir("logs"), "serve.log");
-            params.add("--log-file");
-            params.add(serveLog.getAbsolutePath());
-        }
-
         String[] env = getRcloneEnv();
         String[] command = params.toArray(new String[0]);
         try {
@@ -798,7 +999,7 @@ public class Rclone {
 
         String[] env = getRcloneEnv();
         try {
-            return getRuntimeProcess(command, env);
+            return getRuntimeProcessRaw(command, env);
         } catch (IOException e) {
             FLog.e(TAG, "sync: error starting rclone", e);
             return null;
@@ -828,7 +1029,7 @@ public class Rclone {
 
         String[] env = getRcloneEnv();
         try {
-            return getRuntimeProcess(command, env);
+            return getRuntimeProcessRaw(command, env);
         } catch (IOException e) {
             FLog.e(TAG, "downloadFile: error starting rclone", e);
             return null;
@@ -860,7 +1061,7 @@ public class Rclone {
 
         String[] env = getRcloneEnv();
         try {
-            return getRuntimeProcess(command, env);
+            return getRuntimeProcessRaw(command, env);
         } catch (IOException e) {
             FLog.e(TAG, "uploadFile: error starting rclone", e);
             return null;
@@ -909,7 +1110,7 @@ public class Rclone {
 
         String[] env = getRcloneEnv();
         try {
-            process = getRuntimeProcess(command, env);
+            process = getRuntimeProcessRaw(command, env);
         } catch (IOException e) {
             FLog.e(TAG, "deleteItems: error starting rclone", e);
         }
@@ -961,7 +1162,7 @@ public class Rclone {
         command = createCommandWithOptions("moveto", oldFilePath, newFilePath);
         String[] env = getRcloneEnv();
         try {
-            process = getRuntimeProcess(command, env);
+            process = getRuntimeProcessRaw(command, env);
         } catch (IOException e) {
             FLog.e(TAG, "moveTo: error starting rclone", e);
         }
@@ -1068,19 +1269,10 @@ public class Rclone {
     }
 
     private InputStream startCatProcess(String[] command, long idleTimeoutMs) throws IOException {
-        SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context);
-        boolean saveErrorOutput = sharedPreferences.getBoolean(
-                context.getString(R.string.pref_key_logs), false);
         String[] env = getRcloneEnv();
-        final Process process = getRuntimeProcess(command, env);
+        final Process process = getRuntimeProcessRaw(command, env);
         long streamId = RCLONE_CAT_STREAM_SEQUENCE.incrementAndGet();
-        InputStream errorStream = process.getErrorStream();
-
-        Thread stderrDrainer = new Thread(
-                () -> drainCatErrorOutput(errorStream, saveErrorOutput, streamId),
-                "rclone-cat-stderr-" + streamId);
-        stderrDrainer.setDaemon(true);
-        stderrDrainer.start();
+        startErrorOutputDrainer(process, "cat");
 
         Thread waiter = new Thread(() -> {
             try {
@@ -1099,33 +1291,6 @@ public class Rclone {
                 : input;
     }
 
-    private void drainCatErrorOutput(InputStream errorStream, boolean saveOutput, long streamId) {
-        StringBuilder output = saveOutput ? new StringBuilder(100) : null;
-
-        try (Reader reader = new InputStreamReader(errorStream)) {
-            char[] buffer = new char[4096];
-            int charsRead;
-            while ((charsRead = reader.read(buffer)) != -1) {
-                if (output != null) {
-                    output.append(buffer, 0, charsRead);
-                }
-            }
-        } catch (InterruptedIOException iioe) {
-            FLog.i(TAG, "drainCatErrorOutput: rclone cat process died while reading stderr. "
-                    + "Log may be incomplete. streamId=" + streamId);
-        } catch (IOException e) {
-            if ("Stream closed".equals(e.getMessage())) {
-                FLog.d(TAG, "drainCatErrorOutput: stderr stream is already closed. streamId="
-                        + streamId);
-            } else {
-                FLog.e(TAG, "drainCatErrorOutput: error draining stderr. streamId=" + streamId, e);
-            }
-        }
-
-        if (output != null && output.length() > 0) {
-            log2File.log(output.toString());
-        }
-    }
 
     private static final class ManagedProcessInputStream extends FilterInputStream {
         private final Process process;
@@ -1426,7 +1591,7 @@ public class Rclone {
         String[] command = createCommand("config", "reconnect", remoteName);
 
         try {
-            return getRuntimeProcess(command, getRcloneEnv());
+            return getRuntimeProcessRaw(command, getRcloneEnv());
         } catch (IOException e) {
             return null;
         }
@@ -1525,7 +1690,7 @@ public class Rclone {
         String[] command = createCommand( "--ask-password=false", "listremotes");
         Process process;
         try {
-            process = getRuntimeProcess(command);
+            process = getRuntimeProcessWithoutFailureLog(command);
             process.waitFor();
         } catch (IOException | InterruptedException e) {
             FLog.e(TAG, "Error running rclone %s", e, Arrays.toString(command));
@@ -1838,20 +2003,24 @@ public class Rclone {
 
 
     public boolean isValidConfig(String path) {
-        String[] command = {rclone, "-vvv", "--ask-password=false", "--config", path, "listremotes"};
+        String[] command = {rclone, "--ask-password=false", "--config", path, "listremotes"};
         try {
             Process process = getRuntimeProcess(command);
             process.waitFor();
-            if (process.exitValue() != 0) { //
-                try (BufferedReader stdOut = new BufferedReader(new InputStreamReader(process.getInputStream()));
-                     BufferedReader stdErr = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
+            if (process.exitValue() != 0) {
+                String stdOut;
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+                    StringBuilder output = new StringBuilder();
                     String line;
-                    while ((line = stdOut.readLine()) != null || (line = stdErr.readLine()) != null) {
-                        if (line.contains("could not parse line")) {
-                            return false;
-                        }
+                    while ((line = reader.readLine()) != null) {
+                        output.append(line).append('\n');
                     }
+                    stdOut = output.toString();
                 }
+                String stdErr = getCollectedErrorOutput(process);
+                return !(stdOut.contains("could not parse line")
+                        || stdErr.contains("could not parse line"));
             }
         } catch (IOException | InterruptedException e) {
             return false;
