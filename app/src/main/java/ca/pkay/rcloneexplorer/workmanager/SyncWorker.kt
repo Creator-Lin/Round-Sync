@@ -174,21 +174,24 @@ class SyncWorker (private var mContext: Context, workerParams: WorkerParameters)
                         val line = iterator.next()
                         try {
                             val logline = JSONObject(line)
-                            // todo: migrate this to StatusObject, so that we can handle everything properly.
-                            if (logline.getString("level") == "error") {
+                            val level = logline.optString("level")
+                            if (level == "error") {
                                 rcloneErrorsTruncated = appendBoundedRcloneError(rcloneErrors, line) || rcloneErrorsTruncated
-                                statusObject.parseLoglineToStatusObject(logline)
-                            } else if (logline.getString("level") == "warning") {
-                                statusObject.parseLoglineToStatusObject(logline)
                             }
+                            // Stats are emitted at NOTICE level, so route by payload as well as level.
+                            if (logline.has("stats") || level == "error") {
+                                statusObject.parseLoglineToStatusObject(logline)
 
-                            updateForegroundNotification(mNotificationManager.updateSyncNotification(
-                            title,
-                            statusObject.notificationContent,
-                            statusObject.notificationBigText,
-                            statusObject.notificationPercent,
-                            ongoingNotificationID
-                        ))
+                                updateForegroundNotification(
+                                    mNotificationManager.updateSyncNotification(
+                                        title,
+                                        statusObject.notificationContent,
+                                        statusObject.notificationBigText,
+                                        statusObject.notificationPercent,
+                                        ongoingNotificationID
+                                    )
+                                )
+                            }
                         } catch (e: JSONException) {
                             FLog.e(TAG, "Rclone stderr was not valid JSON: $line")
                             unstructuredTruncated = appendBoundedRcloneError(unstructuredStderr, line) || unstructuredTruncated

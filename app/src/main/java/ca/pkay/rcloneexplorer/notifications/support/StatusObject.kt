@@ -78,11 +78,12 @@ class StatusObject(var mContext: Context){
     }
 
     fun parseLoglineToStatusObject(logLine: JSONObject) {
-        if(logLine.getString("level") == "error") {
+        val level = logLine.optString("level")
+        if(level == "error") {
             clearObject()
             mLogline = logLine
 
-            var error = ErrorObject(getErrorObject(), getErrorMessage())
+            val error = ErrorObject(getErrorObject(), getErrorMessage())
             Log.e(TAG, error.mErrorObject + " - " + error.mErrorMessage)
             mErrorList.add(error)
         }
