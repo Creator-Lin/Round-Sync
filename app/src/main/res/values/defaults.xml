@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <bool name="default_thumbnail_image_enabled">true</bool>
+    <bool name="default_thumbnail_video_enabled">true</bool>
+    <integer name="default_thumbnail_image_source_max_mb">8</integer>
+    <integer name="default_thumbnail_image_disk_cache_max_mb">2048</integer>
+    <integer name="default_thumbnail_image_disk_cache_trim_target_mb">1536</integer>
+    <integer name="default_thumbnail_video_disk_cache_max_mb">2048</integer>
+    <integer name="default_thumbnail_video_disk_cache_trim_target_mb">1536</integer>
+</resources>

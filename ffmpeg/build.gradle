@@ -1,0 +1,316 @@
+// Builds an LGPL, thumbnail-only FFmpeg JNI library for each Android ABI.
+// FFmpeg itself is configured without programs, network protocols, encoders,
+// filters or devices; media bytes enter only through the custom JNI AVIOContext.
+
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.Paths
+import java.security.MessageDigest
+
+ext {
+    NDK_VERSION = project.properties['de.felixnuesse.extract.ndkVersion']
+    ANDROID_API = 23
+    SOURCE_DIR = Paths.get(projectDir.absolutePath, 'ffmpeg-src').toString()
+    JNI_SOURCE = Paths.get(projectDir.absolutePath, 'jni', 'ffmpeg_thumbnail_jni.c').toString()
+    CACHE_DIR = Paths.get(projectDir.absolutePath, 'cache').toString()
+    OUTPUT_BASE_PATH = Paths.get(projectDir.absolutePath, '..', 'app', 'lib')
+            .toAbsolutePath().normalize().toString()
+}
+
+static String hostTag() {
+    String osName = System.properties['os.name']
+    String osArch = System.properties['os.arch']
+    if (osName.startsWith('Linux') && osArch == 'amd64') return 'linux-x86_64'
+    if (osName.startsWith('Mac') && ['aarch64', 'amd64'].contains(osArch)) return 'darwin-x86_64'
+    if (osName.startsWith('Windows') && osArch == 'amd64') return 'windows-x86_64'
+    throw new GradleException("Unsupported FFmpeg build host: ${osName}/${osArch}")
+}
+
+def findSdkDir() {
+    def androidHome = System.getenv('ANDROID_HOME') ?: System.getenv('ANDROID_SDK_ROOT')
+    if (androidHome != null) return androidHome
+    def localPropertiesFile = project.rootProject.file('local.properties')
+    if (localPropertiesFile.exists()) {
+        Properties properties = new Properties()
+        properties.load(localPropertiesFile.newDataInputStream())
+        def sdkDir = properties.get('sdk.dir')
+        if (sdkDir != null) return sdkDir
+    }
+    throw new GradleException('Could not locate the Android SDK')
+}
+
+def findNdkDir() {
+    Path ndkPath = Paths.get(findSdkDir(), 'ndk', NDK_VERSION).toAbsolutePath()
+    if (!Files.isDirectory(ndkPath)) {
+        throw new GradleException("Could not find Android NDK ${NDK_VERSION} at ${ndkPath}")
+    }
+    return ndkPath.toString()
+}
+
+def toolchainBin() {
+    return Paths.get(findNdkDir(), 'toolchains', 'llvm', 'prebuilt', hostTag(), 'bin')
+}
+
+def abiConfig(String abi) {
+    def configs = [
+        'armeabi-v7a': [arch: 'arm', cpu: 'armv7-a', triple: 'armv7a-linux-androideabi'],
+        'arm64-v8a'  : [arch: 'aarch64', cpu: 'armv8-a', triple: 'aarch64-linux-android'],
+        'x86'        : [arch: 'x86', cpu: 'i686', triple: 'i686-linux-android'],
+        'x86_64'     : [arch: 'x86_64', cpu: 'x86-64', triple: 'x86_64-linux-android'],
+    ]
+    def config = configs[abi]
+    if (config == null) throw new GradleException("Unsupported ABI: ${abi}")
+    return config
+}
+
+
+def sha256(String value) {
+    MessageDigest digest = MessageDigest.getInstance('SHA-256')
+    return digest.digest(value.getBytes('UTF-8')).encodeHex().toString()
+}
+
+// FFmpeg's Makefiles execute these scripts directly rather than through `sh`.
+// Git/ZIP transfers (especially through Windows) may lose Unix executable bits,
+// which causes make to fail with exit status 126 even though configure succeeded.
+def ensureExecutable(File script) {
+    if (!script.isFile()) {
+        throw new GradleException("Missing FFmpeg build script: ${script}")
+    }
+    if (!script.canExecute()) {
+        project.logger.lifecycle("Restoring executable permission for ${script}")
+        script.setExecutable(true, false)
+    }
+    if (!script.canExecute()) {
+        throw new GradleException(
+                "FFmpeg build script is not executable: ${script}. "
+                + 'Check filesystem mount options and source file permissions.')
+    }
+}
+
+def ensureFfmpegBuildScriptsExecutable(File sourceDirectory) {
+    [
+        'configure',
+        'ffbuild/version.sh',
+        'ffbuild/libversion.sh',
+        'ffbuild/pkgconfig_generate.sh',
+    ].each { relativePath ->
+        ensureExecutable(new File(sourceDirectory, relativePath))
+    }
+}
+
+def outputPath(String abi) {
+    return Paths.get(OUTPUT_BASE_PATH, abi, 'libroundsync_ffmpeg.so').toString()
+}
+
+def buildDir(String abi) {
+    return Paths.get(CACHE_DIR, 'build', abi).toString()
+}
+
+def installDir(String abi) {
+    return Paths.get(CACHE_DIR, 'install', abi).toString()
+}
+
+def configureArguments(String abi) {
+    def config = abiConfig(abi)
+    Path bin = toolchainBin()
+    String executableSuffix = hostTag().startsWith('windows') ? '.exe' : ''
+    String cc = bin.resolve("${config.triple}${ANDROID_API}-clang${executableSuffix}").toString()
+    String ar = bin.resolve("llvm-ar${executableSuffix}").toString()
+    String ranlib = bin.resolve("llvm-ranlib${executableSuffix}").toString()
+    String nm = bin.resolve("llvm-nm${executableSuffix}").toString()
+    String strip = bin.resolve("llvm-strip${executableSuffix}").toString()
+    String sysroot = Paths.get(findNdkDir(), 'toolchains', 'llvm', 'prebuilt', hostTag(), 'sysroot')
+            .toString()
+
+    def demuxers = [
+        'asf', 'avi', 'flv', 'h264', 'hevc', 'matroska', 'mjpeg', 'mov',
+        'mpegps', 'mpegts', 'ogg', 'rm', 'vc1'
+    ].join(',')
+    def decoders = [
+        // Windows Media / ASF family.
+        'wmv1', 'wmv2', 'wmv3', 'vc1', 'msmpeg4v1', 'msmpeg4v2', 'msmpeg4v3',
+        // Common modern and web codecs.
+        'h264', 'hevc', 'mpeg1video', 'mpeg2video', 'mpeg4', 'vp8', 'vp9', 'av1',
+        // Common legacy/professional codecs encountered in AVI/MOV/MKV.
+        'flv', 'h263', 'h263i', 'h263p', 'theora', 'prores', 'mjpeg', 'mjpegb',
+        'bmp', 'rawvideo', 'dvvideo', 'indeo3', 'indeo4', 'indeo5', 'cinepak',
+        'svq1', 'svq3', 'ffv1', 'huffyuv', 'utvideo', 'qtrle', 'rpza', 'msvideo1'
+    ].join(',')
+    def parsers = [
+        'av1', 'h264', 'hevc', 'mpeg4video', 'mpegvideo', 'vc1', 'vp8', 'vp9'
+    ].join(',')
+
+    return [
+        "--prefix=${installDir(abi)}",
+        '--target-os=android',
+        '--enable-cross-compile',
+        "--arch=${config.arch}",
+        "--cpu=${config.cpu}",
+        "--cc=${cc}",
+        "--ar=${ar}",
+        "--ranlib=${ranlib}",
+        "--nm=${nm}",
+        "--strip=${strip}",
+        "--sysroot=${sysroot}",
+        '--disable-everything',
+        '--disable-autodetect',
+        '--disable-iconv',
+        '--disable-zlib',
+        '--disable-bzlib',
+        '--disable-lzma',
+        '--disable-programs',
+        '--disable-doc',
+        '--disable-network',
+        '--disable-avdevice',
+        '--disable-avfilter',
+        '--disable-swresample',
+        '--disable-asm',
+        '--disable-inline-asm',
+        '--disable-runtime-cpudetect',
+        '--disable-debug',
+        '--disable-symver',
+        '--disable-gpl',
+        '--disable-nonfree',
+        '--enable-small',
+        '--enable-pic',
+        '--enable-static',
+        '--disable-shared',
+        '--enable-pthreads',
+        '--enable-avcodec',
+        '--enable-avformat',
+        '--enable-avutil',
+        '--enable-swscale',
+        "--enable-demuxer=${demuxers}",
+        "--enable-decoder=${decoders}",
+        "--enable-parser=${parsers}",
+        '--extra-cflags=-Os -fPIC -ffunction-sections -fdata-sections',
+        '--extra-ldflags=-Wl,--gc-sections -Wl,--build-id=none -Wl,-z,max-page-size=16384',
+    ]
+}
+
+def buildFfmpeg(String abi) {
+    return {
+        inputs.file JNI_SOURCE
+        inputs.file project.buildFile
+        inputs.dir SOURCE_DIR
+        outputs.file outputPath(abi)
+
+        doLast {
+            if (hostTag().startsWith('windows')) {
+                throw new GradleException(
+                        'The bundled FFmpeg source build requires a POSIX shell and make. '
+                        + 'Build from WSL/MSYS2 or a Linux/macOS host.')
+            }
+
+            File sourceDirectory = file(SOURCE_DIR)
+            if (!sourceDirectory.isDirectory()) {
+                throw new GradleException("Missing bundled FFmpeg source at ${SOURCE_DIR}")
+            }
+            ensureFfmpegBuildScriptsExecutable(sourceDirectory)
+
+            File nativeBuildDirectory = file(buildDir(abi))
+            File nativeInstallDirectory = file(installDir(abi))
+            nativeBuildDirectory.mkdirs()
+            nativeInstallDirectory.mkdirs()
+
+            File makefile = new File(nativeBuildDirectory, 'Makefile')
+            File configFingerprintFile = new File(nativeBuildDirectory, '.roundsync-config')
+            String configFingerprint = sha256(configureArguments(abi).join('\n'))
+            if (!makefile.exists()
+                    || !configFingerprintFile.isFile()
+                    || configFingerprintFile.text.trim() != configFingerprint) {
+                delete nativeBuildDirectory
+                delete nativeInstallDirectory
+                nativeBuildDirectory.mkdirs()
+                nativeInstallDirectory.mkdirs()
+                exec {
+                    workingDir nativeBuildDirectory
+                    commandLine(['bash', new File(sourceDirectory, 'configure').absolutePath]
+                            + configureArguments(abi))
+                }
+                configFingerprintFile.text = configFingerprint + System.lineSeparator()
+            }
+
+            int jobs = Math.max(1, Math.min(Runtime.getRuntime().availableProcessors(), 8))
+            exec {
+                workingDir nativeBuildDirectory
+                commandLine 'make', "-j${jobs}"
+            }
+            exec {
+                workingDir nativeBuildDirectory
+                commandLine 'make', 'install'
+            }
+
+            def config = abiConfig(abi)
+            Path bin = toolchainBin()
+            String cc = bin.resolve("${config.triple}${ANDROID_API}-clang").toString()
+            String strip = bin.resolve('llvm-strip').toString()
+            File output = file(outputPath(abi))
+            output.parentFile.mkdirs()
+
+            File libDir = new File(nativeInstallDirectory, 'lib')
+            File includeDir = new File(nativeInstallDirectory, 'include')
+            def staticLibraries = [
+                new File(libDir, 'libavformat.a'),
+                new File(libDir, 'libavcodec.a'),
+                new File(libDir, 'libswscale.a'),
+                new File(libDir, 'libavutil.a'),
+            ]
+            staticLibraries.each {
+                if (!it.isFile()) throw new GradleException("Missing FFmpeg library: ${it}")
+            }
+
+            exec {
+                commandLine([
+                    cc,
+                    '-shared',
+                    '-std=c11',
+                    '-Os',
+                    '-fPIC',
+                    '-ffunction-sections',
+                    '-fdata-sections',
+                    '-I', includeDir.absolutePath,
+                    JNI_SOURCE,
+                    '-o', output.absolutePath,
+                    '-Wl,--start-group',
+                ] + staticLibraries.collect { it.absolutePath } + [
+                    '-Wl,--end-group',
+                    '-Wl,--gc-sections',
+                    '-Wl,--exclude-libs,ALL',
+                    '-Wl,--no-undefined',
+                    '-Wl,--build-id=none',
+                    '-Wl,-z,max-page-size=16384',
+                    '-pthread',
+                    '-ljnigraphics',
+                    '-llog',
+                    '-landroid',
+                    '-latomic',
+                    '-ldl',
+                    '-lm',
+                    '-lz',
+                ])
+            }
+            exec {
+                commandLine strip, '--strip-unneeded', output.absolutePath
+            }
+        }
+    }
+}
+
+task buildArm { configure buildFfmpeg('armeabi-v7a') }
+task buildArm64 { configure buildFfmpeg('arm64-v8a') }
+task buildx86 { configure buildFfmpeg('x86') }
+task buildx64 { configure buildFfmpeg('x86_64') }
+
+task buildAll {
+    dependsOn buildArm, buildArm64, buildx86, buildx64
+}
+
+task clean {
+    doLast {
+        delete CACHE_DIR
+        delete fileTree(OUTPUT_BASE_PATH).matching { include '**/libroundsync_ffmpeg.so' }
+    }
+}
+
+defaultTasks 'buildAll'

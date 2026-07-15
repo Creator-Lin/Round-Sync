@@ -1,0 +1,90 @@
+// Builds the cookie-only QuarkDav server as an Android-native PIE executable.
+// The .so suffix makes Android package it in nativeLibraryDir, matching the
+// existing Round-Sync rclone executable-kernel layout.
+
+import java.nio.file.Paths
+
+ext {
+    NDK_VERSION = project.properties['de.felixnuesse.extract.ndkVersion']
+    NDK_TOOLCHAIN_VERSION = project.properties['de.felixnuesse.extract.ndkToolchainVersion']
+    SOURCE_DIR = Paths.get(projectDir.absolutePath, 'quarkdav-src').toString()
+    OUTPUT_BASE_PATH = Paths.get(projectDir.absolutePath, '..', 'app', 'lib').toAbsolutePath().toString()
+}
+
+def findSdkDir() {
+    def androidHome = System.getenv('ANDROID_HOME') ?: System.getenv('ANDROID_SDK_ROOT')
+    if (androidHome != null) return androidHome
+    def localPropertiesFile = project.rootProject.file('local.properties')
+    if (localPropertiesFile.exists()) {
+        Properties properties = new Properties()
+        properties.load(localPropertiesFile.newDataInputStream())
+        def sdkDir = properties.get('sdk.dir')
+        if (sdkDir != null) return sdkDir
+    }
+    throw new GradleException("Couldn't locate Android SDK")
+}
+
+def findNdkDir() {
+    def ndkPath = Paths.get(findSdkDir(), 'ndk', NDK_VERSION).toAbsolutePath()
+    if (!ndkPath.toFile().exists()) throw new GradleException("Couldn't find NDK ${NDK_VERSION} at ${ndkPath}")
+    return ndkPath.toString()
+}
+
+def getCrossCompiler(abi) {
+    def osName = System.properties['os.name']
+    def osArch = System.properties['os.arch']
+    def host = null
+    if (osName.startsWith('Windows') && osArch == 'amd64') host = 'windows-x86_64'
+    else if (osName.startsWith('Linux') && osArch == 'amd64') host = 'linux-x86_64'
+    else if (osName.startsWith('Mac') && ['aarch64', 'amd64'].contains(osArch)) host = 'darwin-x86_64'
+    if (host == null) throw new GradleException('Unsupported host OS or architecture')
+
+    def compilers = [
+        'armeabi-v7a': "armv7a-linux-androideabi${NDK_TOOLCHAIN_VERSION}-clang",
+        'arm64-v8a': "aarch64-linux-android${NDK_TOOLCHAIN_VERSION}-clang",
+        'x86': "i686-linux-android${NDK_TOOLCHAIN_VERSION}-clang",
+        'x86_64': "x86_64-linux-android${NDK_TOOLCHAIN_VERSION}-clang",
+    ]
+    return Paths.get(findNdkDir(), 'toolchains', 'llvm', 'prebuilt', host, 'bin', compilers[abi]).toString()
+}
+
+def outputPath(abi) {
+    return Paths.get(OUTPUT_BASE_PATH, abi, 'libquarkdav.so').toString()
+}
+
+def buildKernel(abi) {
+    def abiEnv = [
+        'armeabi-v7a': ['GOARCH': 'arm', 'GOARM': '7'],
+        'arm64-v8a': ['GOARCH': 'arm64'],
+        'x86': ['GOARCH': '386'],
+        'x86_64': ['GOARCH': 'amd64', 'GOAMD64': 'v1'],
+    ]
+    return {
+        doLast {
+            file(outputPath(abi)).parentFile.mkdirs()
+            exec {
+                def cc = getCrossCompiler(abi)
+                environment 'CC', cc
+                environment 'CC_FOR_TARGET', cc
+                environment 'GOOS', 'android'
+                environment 'CGO_ENABLED', '1'
+                environment 'CGO_LDFLAGS', '-fuse-ld=lld -Wl,--hash-style=both'
+                abiEnv[abi].each { entry -> environment entry.key, entry.value }
+                workingDir SOURCE_DIR
+                commandLine 'go', 'build', '-trimpath', '-ldflags=-s -w -buildid=', '-o', outputPath(abi), './cmd/quarkdav'
+            }
+        }
+    }
+}
+
+task buildArm { configure buildKernel('armeabi-v7a') }
+task buildArm64 { configure buildKernel('arm64-v8a') }
+task buildx86 { configure buildKernel('x86') }
+task buildx64 { configure buildKernel('x86_64') }
+task buildAll { dependsOn buildArm, buildArm64, buildx86, buildx64 }
+
+task clean {
+    doLast { delete fileTree(OUTPUT_BASE_PATH).matching { include '**/libquarkdav.so' } }
+}
+
+defaultTasks 'buildAll'

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <item
+        android:id="@+id/action_view_mode"
+        android:icon="@drawable/ic_round_list_24"
+        android:title="@string/view_mode"
+        app:showAsAction="ifRoom">
+        <menu>
+            <group android:checkableBehavior="single">
+                <item
+                    android:id="@+id/action_view_list"
+                    android:title="@string/view_mode_list" />
+                <item
+                    android:id="@+id/action_view_icons_extra_large"
+                    android:title="@string/view_mode_icons_extra_large" />
+                <item
+                    android:id="@+id/action_view_icons_large"
+                    android:title="@string/view_mode_icons_large" />
+                <item
+                    android:id="@+id/action_view_icons_medium"
+                    android:title="@string/view_mode_icons_medium" />
+                <item
+                    android:id="@+id/action_view_icons_small"
+                    android:title="@string/view_mode_icons_small" />
+            </group>
+        </menu>
+    </item>
+
+    <item
+        android:id="@+id/action_sort"
+        android:icon="@drawable/ic_sort"
+        android:title="@string/sort"
+        app:showAsAction="ifRoom" />
+
+    <item
+        android:id="@+id/action_select_all"
+        android:icon="@drawable/ic_select_all"
+        android:title="@string/select_all"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_go_to"
+        android:title="@string/go_to"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_link"
+        android:title="@string/link"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_serve"
+        android:title="@string/serve"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_sync"
+        android:title="@string/sync"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_empty_trash"
+        android:title="@string/empty_trash"
+        app:showAsAction="never" />
+</menu>

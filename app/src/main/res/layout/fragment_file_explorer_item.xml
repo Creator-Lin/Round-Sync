@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    style="@style/FileListItem"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingTop="@dimen/filepicker_row_padding"
+    android:paddingBottom="@dimen/filepicker_row_padding"
+    android:theme="@style/FileListItem">
+
+    <RelativeLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="64dp"
+        android:background="?selectableItemBackground">
+
+        <FrameLayout
+            android:id="@+id/icons"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_centerVertical="true"
+            android:layout_marginStart="12dp"
+            android:layout_marginEnd="12dp">
+
+            <ImageView
+                android:id="@+id/file_icon"
+                android:layout_width="52dp"
+                android:layout_height="52dp"
+                android:layout_gravity="center"
+                android:contentDescription="@string/file_icon"
+                android:scaleType="centerCrop"
+                android:src="@drawable/ic_file" />
+
+            <ImageView
+                android:id="@+id/dir_icon"
+                android:layout_width="42dp"
+                android:layout_height="42dp"
+                android:layout_gravity="center"
+                android:contentDescription="@string/file_icon"
+                android:scaleType="centerInside"
+                android:src="@drawable/ic_folder" />
+        </FrameLayout>
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_centerVertical="true"
+            android:layout_toStartOf="@id/file_options"
+            android:layout_toEndOf="@id/icons"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/file_name"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:ellipsize="middle"
+                android:fontFamily="sans-serif"
+                android:singleLine="true"
+                android:textSize="16sp"
+                tools:text="Test File" />
+
+            <LinearLayout
+                android:id="@+id/file_details"
+                style="@style/FileListItemDescription"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:theme="@style/FileListItemDescription">
+
+                <TextView
+                    android:id="@+id/file_modtime"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    tools:text="2018-01-01" />
+
+                <TextView
+                    android:id="@+id/interpunct"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:text="@string/interpunct" />
+
+                <TextView
+                    android:id="@+id/file_size"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    tools:text="2 MB" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <ImageButton
+            android:id="@+id/file_options"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_alignParentEnd="true"
+            android:layout_centerVertical="true"
+            android:background="?selectableItemBackgroundBorderless"
+            android:contentDescription="@string/file_options_content_description"
+            android:paddingStart="@dimen/filepicker_more_padding"
+            android:paddingTop="@dimen/filepicker_more_padding"
+            android:paddingEnd="@dimen/filepicker_more_padding"
+            android:paddingBottom="@dimen/filepicker_more_padding"
+            android:src="@drawable/ic_more_vert" />
+    </RelativeLayout>
+
+</LinearLayout>
