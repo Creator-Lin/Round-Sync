@@ -45,6 +45,7 @@ import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import ca.pkay.rcloneexplorer.Database.json.Exporter;
 import ca.pkay.rcloneexplorer.Database.json.SharedPreferencesBackup;
@@ -63,6 +64,7 @@ import io.github.x0b.safdav.file.SafConstants;
 public class Rclone {
 
     private static final String TAG = "Rclone";
+    private static final AtomicLong RCLONE_CAT_STREAM_SEQUENCE = new AtomicLong();
     public static final int SYNC_DIRECTION_LOCAL_TO_REMOTE = 1;
     public static final int SYNC_DIRECTION_REMOTE_TO_LOCAL = 2;
     public static final int SERVE_PROTOCOL_HTTP = 1;
@@ -1066,17 +1068,28 @@ public class Rclone {
     }
 
     private InputStream startCatProcess(String[] command, long idleTimeoutMs) throws IOException {
+        SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context);
+        boolean saveErrorOutput = sharedPreferences.getBoolean(
+                context.getString(R.string.pref_key_logs), false);
         String[] env = getRcloneEnv();
         final Process process = getRuntimeProcess(command, env);
+        long streamId = RCLONE_CAT_STREAM_SEQUENCE.incrementAndGet();
+        InputStream errorStream = process.getErrorStream();
+
+        Thread stderrDrainer = new Thread(
+                () -> drainCatErrorOutput(errorStream, saveErrorOutput, streamId),
+                "rclone-cat-stderr-" + streamId);
+        stderrDrainer.setDaemon(true);
+        stderrDrainer.start();
+
         Thread waiter = new Thread(() -> {
             try {
                 process.waitFor();
-                logErrorOutput(process);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 FLog.e(TAG, "downloadToPipe: error waiting for process", e);
             }
-        }, "rclone-cat-waiter");
+        }, "rclone-cat-waiter-" + streamId);
         waiter.setDaemon(true);
         waiter.start();
 
@@ -1084,6 +1097,34 @@ public class Rclone {
         return idleTimeoutMs > 0L
                 ? new ManagedProcessInputStream(input, process, idleTimeoutMs)
                 : input;
+    }
+
+    private void drainCatErrorOutput(InputStream errorStream, boolean saveOutput, long streamId) {
+        StringBuilder output = saveOutput ? new StringBuilder(100) : null;
+
+        try (Reader reader = new InputStreamReader(errorStream)) {
+            char[] buffer = new char[4096];
+            int charsRead;
+            while ((charsRead = reader.read(buffer)) != -1) {
+                if (output != null) {
+                    output.append(buffer, 0, charsRead);
+                }
+            }
+        } catch (InterruptedIOException iioe) {
+            FLog.i(TAG, "drainCatErrorOutput: rclone cat process died while reading stderr. "
+                    + "Log may be incomplete. streamId=" + streamId);
+        } catch (IOException e) {
+            if ("Stream closed".equals(e.getMessage())) {
+                FLog.d(TAG, "drainCatErrorOutput: stderr stream is already closed. streamId="
+                        + streamId);
+            } else {
+                FLog.e(TAG, "drainCatErrorOutput: error draining stderr. streamId=" + streamId, e);
+            }
+        }
+
+        if (output != null && output.length() > 0) {
+            log2File.log(output.toString());
+        }
     }
 
     private static final class ManagedProcessInputStream extends FilterInputStream {
